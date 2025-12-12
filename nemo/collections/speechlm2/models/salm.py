@@ -39,7 +39,7 @@ from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
-from nemo.collections.speechlm2.parts.pretrained import load_pretrained_hf, move_embedding, setup_speech_encoder
+from nemo.collections.speechlm2.parts.pretrained import delete_embeddings, load_pretrained_hf, move_embedding, setup_speech_encoder
 from nemo.utils import logging
 
 
@@ -56,11 +56,19 @@ class SALM(LightningModule, HFHubMixin):
 
         self.tokenizer = AutoTokenizer(self.cfg.pretrained_llm, use_fast=True)
         self.tokenizer.add_special_tokens({"additional_special_tokens": [self.audio_locator_tag]})
-        self.llm = load_pretrained_hf(self.cfg.pretrained_llm, pretrained_weights=self.cfg.pretrained_weights)
+        self.llm = load_pretrained_hf(self.cfg.pretrained_llm, pretrained_weights=self.cfg.pretrained_weights, trust_remote_code=self.cfg.trust_remote_code)
         # Note: we have to "move out" the token embedding outside of LLM to avoid
         #       messing up FSDP/TP hooks.
-        self.embed_tokens = self.llm.model.embed_tokens
-        del self.llm.model.embed_tokens
+        # self.embed_tokens = self.llm.model.embed_tokens
+        self.embed_tokens = self.llm.get_input_embeddings()
+        # del self.llm.model.embed_tokens
+        
+        if delete_embeddings(self.llm):
+            print("✓ Deleted embeddings from LLM")
+        else:
+            print("⚠ Warning: Could not delete embeddings from LLM (or already deleted)")
+            print(f"  Model type: {type(self.llm).__name__}")
+
         maybe_install_lora(self)
 
         # Load the pretrained streaming ASR model and copy its parameters into the audio perception module.
