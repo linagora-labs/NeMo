@@ -54,15 +54,35 @@ class SALM(LightningModule, HFHubMixin):
         self.cfg = DictConfig(cfg)
         self.audio_locator_tag = self.cfg.audio_locator_tag
 
+        # Convert string dtype to torch.dtype
+        dtype_str = self.cfg.dtype
+        torch_dtype = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bf16": torch.bfloat16
+        }.get(dtype_str.lower(), torch.float32)
+
+        # Tokenizer
         self.tokenizer = AutoTokenizer(self.cfg.pretrained_llm, use_fast=True)
-        self.tokenizer.add_special_tokens({"additional_special_tokens": [self.audio_locator_tag]})
-        self.llm = load_pretrained_hf(self.cfg.pretrained_llm, pretrained_weights=self.cfg.pretrained_weights, trust_remote_code=self.cfg.trust_remote_code)
+        self.tokenizer.add_special_tokens(
+            {"additional_special_tokens": [self.audio_locator_tag]}
+        )
+
+        # Load pretrained LLM
+        self.llm = load_pretrained_hf(
+            self.cfg.pretrained_llm,
+            pretrained_weights=self.cfg.pretrained_weights,
+            dtype=torch_dtype,
+            trust_remote_code=self.cfg.trust_remote_code
+        )
         # Note: we have to "move out" the token embedding outside of LLM to avoid
         #       messing up FSDP/TP hooks.
         # self.embed_tokens = self.llm.model.embed_tokens
         self.embed_tokens = self.llm.get_input_embeddings()
         # del self.llm.model.embed_tokens
-        
+
+        # assert self.embed_tokens.weight.dtype == self.cfg.dtype
+
         if delete_embeddings(self.llm):
             print("✓ Deleted embeddings from LLM")
         else:
@@ -73,6 +93,14 @@ class SALM(LightningModule, HFHubMixin):
 
         # Load the pretrained streaming ASR model and copy its parameters into the audio perception module.
         setup_speech_encoder(self)
+
+        self.llm.to(torch_dtype)
+        self.perception.to(torch_dtype)
+        self.embed_tokens.to(torch_dtype)
+
+        for name, module in self.named_modules():
+            if "lora" in name.lower():
+                module.to(torch_dtype)
 
         self._use_fsdp = False
         self._use_tp = False
