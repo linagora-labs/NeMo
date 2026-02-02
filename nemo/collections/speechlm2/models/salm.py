@@ -56,10 +56,25 @@ class SALM(LightningModule, HFHubMixin):
         self.save_hyperparameters()
         self.cfg = DictConfig(cfg)
         self.audio_locator_tag = self.cfg.audio_locator_tag
+        # Load pretrained LLM
+        self.llm = load_pretrained_hf(
+            self.cfg.pretrained_llm,
+            pretrained_weights=self.cfg.pretrained_weights,
+            dtype=torch_dtype,
+            trust_remote_code=self.cfg.trust_remote_code
+        )
 
         self.tokenizer = AutoTokenizer(self.cfg.pretrained_llm, use_fast=True)
         self.tokenizer.add_special_tokens({"additional_special_tokens": [self.audio_locator_tag]})
-        self.llm = load_pretrained_hf(self.cfg.pretrained_llm, pretrained_weights=self.cfg.pretrained_weights)
+        
+        # Load pretrained LLM
+        self.llm = load_pretrained_hf(
+            self.cfg.pretrained_llm,
+            pretrained_weights=self.cfg.pretrained_weights,
+            dtype=torch_dtype,
+            trust_remote_code=self.cfg.trust_remote_code
+        )
+
         # Note: we have to "move out" the token embedding outside of LLM to avoid
         #       messing up FSDP/TP hooks.
         self.embed_tokens = self.llm.model.embed_tokens
