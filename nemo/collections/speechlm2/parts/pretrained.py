@@ -52,19 +52,102 @@ def load_pretrained_hf(model_path_or_name: str, pretrained_weights: bool = True,
         config = AutoConfig.from_pretrained(model_path_or_name)
         return AutoModelForCausalLM.from_config(config, torch_dtype=dtype, trust_remote_code=trust_remote_code)
 
+def find_embedding_layer(llm):
+    """
+    Locates the embedding layer in the LLM.
+    Returns (parent_object, attribute_name) where the embedding is located.
+    Returns (None, None) if not found.
+    """
+    # Paths to try for different model architectures
+    paths_to_try = [
+        ['backbone', 'embeddings'],      # NemotronH
+        ['model', 'embed_tokens'],       # Llama, Mistral, Qwen, standard Nemotron
+        ['transformer', 'wte'],          # GPT-2
+        ['gpt_neox', 'embed_in'],       # GPT-NeoX
+        ['decoder', 'embed_tokens'],     # BART, T5
+    ]
+    
+    # Unwrap PeftModel if present
+    if isinstance(llm, PeftModel):
+        llm = llm.base_model.model
+    
+    for path in paths_to_try:
+        obj = llm
+        try:
+            # Navigate to parent
+            for attr in path[:-1]:
+                if hasattr(obj, attr):
+                    obj = getattr(obj, attr)
+                else:
+                    break
+            else:
+                # Successfully navigated to parent
+                final_attr = path[-1]
+                # Check if this could be the right place
+                # We return even if the attribute is missing (it might have been deleted)
+                # But we verify the parent exists and usually has this attribute or is the right structure
+                return obj, final_attr
+        except:
+            continue
+            
+    return None, None
+
+def delete_embeddings(llm):
+    """
+    Delete embeddings from LLM to save memory.
+    Returns True if successful, False otherwise.
+    """
+    parent, attr_name = find_embedding_layer(llm)
+    
+    if parent is not None and attr_name is not None:
+        if hasattr(parent, attr_name):
+            delattr(parent, attr_name)
+            return True
+            
+    return False
 
 @contextmanager
 def move_embedding(model):
-    """Temporarily restores the embedding layer into HF LLM. Supports LoRA models."""
-    if isinstance(model.llm, PeftModel):
-        model.llm.base_model.model.model.embed_tokens = model.embed_tokens
-    else:
-        model.llm.model.embed_tokens = model.embed_tokens
-    yield
-    if isinstance(model.llm, PeftModel):
-        del model.llm.base_model.model.model.embed_tokens
-    else:
-        del model.llm.model.embed_tokens
+    """
+    Context manager to temporarily restore embeddings to the LLM for generation.
+    Handles multiple model architectures automatically.
+    """
+    parent, attr_name = find_embedding_layer(model.llm)
+    
+    if parent is None or attr_name is None:
+        # Could not find embedding location
+        print("⚠ Warning: Could not determine embedding location for move_embedding")
+        print(f"  Model type: {type(model.llm).__name__}")
+        yield
+        return
+    
+    # Save original state (might be None if deleted)
+    original_embed = getattr(parent, attr_name, None)
+    
+    try:
+        # Temporarily restore embeddings for generation
+        setattr(parent, attr_name, model.embed_tokens)
+        yield
+    finally:
+        # Restore original state
+        if original_embed is not None:
+            # Embeddings existed before, restore them
+            setattr(parent, attr_name, original_embed)
+        else:
+            # Embeddings were deleted before, delete them again to save memory
+            if hasattr(parent, attr_name):
+                delattr(parent, attr_name)
+# def move_embedding(model):
+#     """Temporarily restores the embedding layer into HF LLM. Supports LoRA models."""
+#     if isinstance(model.llm, PeftModel):
+#         model.llm.base_model.model.model.embed_tokens = model.embed_tokens
+#     else:
+#         model.llm.model.embed_tokens = model.embed_tokens
+#     yield
+#     if isinstance(model.llm, PeftModel):
+#         del model.llm.base_model.model.model.embed_tokens
+#     else:
+#         del model.llm.model.embed_tokens
 
 
 def setup_audio_codec(model: torch.nn.Module):
