@@ -72,8 +72,7 @@ class SALM(LightningModule, HFHubMixin):
         self.llm = load_pretrained_hf(
             self.cfg.pretrained_llm,
             pretrained_weights=self.cfg.pretrained_weights,
-            dtype=torch_dtype,
-            trust_remote_code=self.cfg.trust_remote_code
+            dtype=torch_dtype
         )
 
         # Note: we have to "move out" the token embedding outside of LLM to avoid

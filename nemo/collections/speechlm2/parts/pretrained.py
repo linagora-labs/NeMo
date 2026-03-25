@@ -42,7 +42,7 @@ def load_pretrained_nemo(cls, model_path_or_name: str):
 
 
 def load_pretrained_hf(
-    model_path_or_name: str, pretrained_weights: bool = True, dtype=torch.float32, trust_remote_code: bool = False
+    model_path_or_name: str, pretrained_weights: bool = True, dtype=torch.float32, trust_remote_code: bool = True
 ):
     """
     Load pretrained HuggingFace AutoModelForCausalLM.
