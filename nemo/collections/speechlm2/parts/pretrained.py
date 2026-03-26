@@ -58,11 +58,11 @@ def load_pretrained_hf(
     """
     if pretrained_weights:
         return AutoModelForCausalLM.from_pretrained(
-            model_path_or_name, torch_dtype=dtype, trust_remote_code=trust_remote_code
+            model_path_or_name, torch_dtype=dtype, trust_remote_code=True
         )
     else:
-        config = AutoConfig.from_pretrained(model_path_or_name, trust_remote_code=trust_remote_code)
-        return AutoModelForCausalLM.from_config(config, torch_dtype=dtype, trust_remote_code=trust_remote_code)
+        config = AutoConfig.from_pretrained(model_path_or_name, trust_remote_code=True)
+        return AutoModelForCausalLM.from_config(config, torch_dtype=dtype, trust_remote_code=True)
 
 def find_embedding_layer(llm):
     """
