@@ -65,8 +65,10 @@ class SALM(LightningModule, HFHubMixin):
             "bf16": torch.bfloat16
         }.get(dtype_str.lower(), torch.float32)
 
-        self.tokenizer = AutoTokenizer(self.cfg.pretrained_llm, use_fast=True)
-        self.tokenizer.add_special_tokens({"additional_special_tokens": [self.audio_locator_tag]})
+        tokenizer_src = self.cfg.get("tokenizer_path", None) or self.cfg.pretrained_llm
+        self.tokenizer = AutoTokenizer(tokenizer_src, use_fast=True)
+        if self.audio_locator_tag not in self.tokenizer.tokenizer.get_vocab():
+            self.tokenizer.add_special_tokens({"additional_special_tokens": [self.audio_locator_tag]})
         
         # Load pretrained LLM
         self.llm = load_pretrained_hf(

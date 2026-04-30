@@ -59,6 +59,22 @@ class HFHubMixin(
         if resolved_config_file is None:
             raise RuntimeError(f"Missing {CONFIG_NAME} file for {model_id=}")
         model_kwargs['cfg'] = OmegaConf.to_container(OmegaConf.load(resolved_config_file))
+        # If a tokenizer was saved alongside the checkpoint, redirect tokenizer loading to it
+        # instead of falling back to the original `pretrained_llm` source.
+        resolved_tokenizer_file = cached_file(
+            model_id,
+            "tokenizer_config.json",
+            cache_dir=cache_dir,
+            force_download=force_download,
+            local_files_only=local_files_only,
+            token=token,
+            revision=revision,
+            _raise_exceptions_for_gated_repo=False,
+            _raise_exceptions_for_missing_entries=False,
+            _raise_exceptions_for_connection_errors=False,
+        )
+        if resolved_tokenizer_file is not None:
+            model_kwargs['cfg']['tokenizer_path'] = str(Path(resolved_tokenizer_file).parent)
         # The setting below tells the model's __init__ not to load the original pretrained weights
         # for individual children modules.
         # To illustrate: if you trained a new model M using a pretrained ASR and a pretrained LLM,
