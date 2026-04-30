@@ -56,12 +56,17 @@ def parse_args():
         help='Path to a data input configuration YAML file. '
         'This is the only type of input specification supported for text data.',
     )
-    parser.add_argument(
+    tok_group = parser.add_mutually_exclusive_group(required=True)
+    tok_group.add_argument(
         "-t",
         "--tokenizer",
         nargs="+",
-        required=True,
         help="Path to one or more SPE tokenizers. More than one means we'll use AggregateTokenizer and --langs argument must also be used. When provided, we'll estimate a 2D distribution for input and output sequence lengths.",
+    )
+    tok_group.add_argument(
+        "--hf-tokenizer",
+        type=str,
+        help="HuggingFace model name or path to load a tokenizer via AutoTokenizer (e.g. Qwen/Qwen3-1.7B).",
     )
     parser.add_argument(
         "-a", "--langs", nargs="+", help="Language names for each of AggregateTokenizer sub-tokenizers."
@@ -101,13 +106,24 @@ def parse_args():
         "--max_tokens",
         type=float,
         default=float("inf"),
-        help="If specified, we'll filter out examples with more tokens than this number.",
+        help="If specified, we'll filter out examples with more tokens than this number. "
+        "When finite, this value is also used as the upper bound of the final emitted bucket, "
+        "so examples in the long tail get their own bin instead of being merged into the last dense bucket.",
     )
     parser.add_argument(
         "--max_tpt",
         type=float,
         default=float("inf"),
         help="If specified, we'll filter out examples with more output tokens per input token than this. ",
+    )
+    parser.add_argument(
+        "--tail-step",
+        type=float,
+        default=1.5,
+        help="Multiplicative growth factor between consecutive tail bins. "
+        "When the gap between the last dense bin and the tail is large, "
+        "log-spaced intermediate bins are inserted so that each bin is roughly "
+        "tail-step times the previous one. Set to 0 to disable.",
     )
     parser.add_argument(
         "-q", "--quiet", type=bool, default=False, help="When specified, only print the estimated duration bins."
@@ -130,11 +146,40 @@ def parse_args():
     parser.add_argument(
         "-m",
         "--measure-total-length",
-        type=bool,
         default=False,
+        action="store_true",
         help="When specified, we'll measure the total length (context+answer, i.e. input_ids) instead of context-only length. Total length is more suitable for decoder-only models while context-only length is more suitable for encoder-decoder models.",
     )
+    parser.add_argument(
+        "--audio-locator-tag",
+        type=str,
+        default="<|audio|>",
+        help="Audio locator tag to propagate to multimodal_conversation adapters (e.g. '<|audio|>'). "
+        "Required when the input_cfg uses multimodal_conversation entries.",
+    )
+    parser.add_argument(
+        "--token-equivalent-duration",
+        type=float,
+        default=0.08,
+        help="Seconds of audio per token. Used to convert audio duration to token count.",
+    )
     return parser.parse_args()
+
+
+def _log_spaced_tail_bins(last_dense: int, tail: int, step: float) -> list[int]:
+    """
+    Return log-spaced intermediate bin boundaries between *last_dense* and *tail*.
+    The number of bins is derived from the ratio: floor(log(tail/last_dense) / log(step)).
+    """
+    if step <= 1.0 or last_dense <= 0 or tail <= last_dense:
+        return []
+    num_bins = int(math.log(tail / last_dense) / math.log(step))
+    if num_bins <= 0:
+        return []
+    # geomspace includes endpoints; strip them (caller handles those)
+    points = np.geomspace(last_dense, tail, num=num_bins + 2)
+    int_points = sorted(set(int(round(p)) for p in points))
+    return [p for p in int_points if last_dense < p < tail]
 
 
 def estimate_token_buckets(
@@ -142,6 +187,8 @@ def estimate_token_buckets(
     num_buckets: int,
     num_subbuckets: int | None,
     quiet: bool,
+    max_tokens: float | None = None,
+    tail_step: float = 1.5,
 ) -> list[tuple[float, float]]:
     """
     This function is based on lhotse.dataset.sampling.dynamic_bucketing.estimate_duration_buckets.
@@ -181,7 +228,7 @@ def estimate_token_buckets(
     size_per_bucket = num_input_tokens.sum() / num_buckets
 
     if not quiet:
-        print("Duration distribution:")
+        print("Input token count distribution:")
         print(pd.Series(num_input_tokens).describe(percentiles=[0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]))
     max_input_tokens = num_input_tokens[-1]
 
@@ -215,7 +262,7 @@ def estimate_token_buckets(
                 bins.append((max_bucket_duration, num_toks))
                 tot_toks = 0
             tot_toks += num_toks
-        bins.append((size, math.ceil(size * max_tpt)))
+        bins.append((max_bucket_duration, math.ceil(max_bucket_duration * max_tpt)))
 
     # Iterate over data, and whenever we hit size_per_bucket, create a new bucket bin.
     for binidx, size in enumerate(num_input_tokens):
@@ -228,12 +275,41 @@ def estimate_token_buckets(
             tot = 0.0
         tot += size
 
-    # Estimate an extra 2D bin set for global max duration.
-    if num_subbuckets is not None:
+    # Always emit a final tail bin so the long tail of the distribution gets its
+    # own bucket (and its own oomptimizer-tuned batch size) instead of being silently
+    # merged into the last dense bucket. If the user passed --max_tokens, extend the
+    # tail bin up to that cap so examples between max_observed and the user cap also
+    # land in a real bucket.
+    #
+    # When the gap between the last dense bin and the tail is large, insert
+    # log-spaced intermediate bins so that padding waste in the tail is reduced.
+    last_dense = (bins[-1][0] if is_2d else bins[-1]) if bins else 0
+    tail = int(max_input_tokens)
+    if max_tokens is not None:
+        tail = max(tail, int(max_tokens))
+
+    intermediate = _log_spaced_tail_bins(last_dense, tail, tail_step)
+    # Trim dense bins from the end to make room for tail bins,
+    # so the total bucket count stays at approximately num_buckets.
+    n_to_trim = min(len(intermediate), len(bins) - 1)  # keep at least 1 dense bin
+    if n_to_trim > 0:
+        del bins[-n_to_trim:]
+        # Recompute with the new last dense bin boundary.
+        last_dense = (bins[-1][0] if is_2d else bins[-1]) if bins else 0
+        intermediate = _log_spaced_tail_bins(last_dense, tail, tail_step)
+
+    if intermediate and not quiet:
+        print(f"Inserting {len(intermediate)} log-spaced tail bins: {intermediate}")
+    for ibin in intermediate:
         if is_2d:
-            _estimate_output_token_buckets(max_bucket_duration=max_input_tokens)
+            _estimate_output_token_buckets(max_bucket_duration=ibin)
         else:
-            bins.append(max_input_tokens)
+            bins.append(ibin)
+
+    if is_2d:
+        _estimate_output_token_buckets(max_bucket_duration=tail)
+    elif not bins or bins[-1] < tail:
+        bins.append(tail)
 
     return bins
 
@@ -289,18 +365,25 @@ def main():
 
     tokenizer = None
     prompt = None
-    if args.tokenizer is not None:
+    if args.hf_tokenizer is not None:
+        tokenizer = AutoTokenizer(args.hf_tokenizer, use_fast=True)
+    elif args.tokenizer is not None:
         tokenizer = load_tokenizer(args.tokenizer, args.langs)
-        if args.prompt_format is not None:
-            prompt_defaults = None
-            if args.prompt is not None:
-                prompt_defaults = ast.literal_eval(args.prompt)
-            prompt = PromptFormatter.resolve(args.prompt_format)(tokenizer._tokenizer, defaults=prompt_defaults)
+    if tokenizer is not None and args.prompt_format is not None:
+        prompt_defaults = None
+        if args.prompt is not None:
+            prompt_defaults = ast.literal_eval(args.prompt)
+        tok_for_prompt = tokenizer._tokenizer if isinstance(tokenizer, TokenizerWrapper) else tokenizer
+        prompt = PromptFormatter.resolve(args.prompt_format)(tok_for_prompt, defaults=prompt_defaults)
 
     assert args.input.endswith(".yaml")
+    dotlist = [f"input_cfg={args.input}", "force_finite=True", "metadata_only=True",
+               f"token_equivalent_duration={args.token_equivalent_duration}"]
+    if args.audio_locator_tag is not None:
+        dotlist.append(f"audio_locator_tag={args.audio_locator_tag}")
     config = OmegaConf.merge(
         OmegaConf.structured(LhotseDataLoadingConfig),
-        OmegaConf.from_dotlist([f"input_cfg={args.input}", "force_finite=True", "metadata_only=True"]),
+        OmegaConf.from_dotlist(dotlist),
     )
     cuts, _ = read_cutset_from_config(config)
     cuts = cuts.map(partial(apply_tokenizer, tokenizer=tokenizer, prompt=prompt), apply_fn=None)
@@ -318,6 +401,8 @@ def main():
         num_buckets=args.buckets,
         num_subbuckets=args.sub_buckets,
         quiet=args.quiet,
+        max_tokens=args.max_tokens if math.isfinite(args.max_tokens) else None,
+        tail_step=args.tail_step,
     )
     if args.sub_buckets is not None:
         token_bins = "[" + ','.join(f"[{b:d},{sb:d}]" for b, sb in token_bins) + "]"
