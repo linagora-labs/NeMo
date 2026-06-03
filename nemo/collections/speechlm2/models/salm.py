@@ -66,8 +66,10 @@ class SALM(LightningModule, HFHubMixin):
         self.cfg = DictConfig(cfg)
         self.audio_locator_tag = self.cfg.audio_locator_tag
 
-        # Resolve the configured compute dtype for the LLM (defaults to float32 if unset).
-        torch_dtype = str_to_dtype(self.cfg.get("dtype", "float32"))
+        # Load the LLM weights directly in the trainer's compute dtype. Avoiding OOM at loading time.
+        torch_dtype = torch.get_default_dtype()
+        if torch_dtype == torch.float32 and self.cfg.get("torch_dtype", None) is not None:
+            torch_dtype = str_to_dtype(self.cfg.torch_dtype)
 
         tokenizer_src = self.cfg.get("tokenizer_path", None) or self.cfg.pretrained_llm
         self.tokenizer = AutoTokenizer(
