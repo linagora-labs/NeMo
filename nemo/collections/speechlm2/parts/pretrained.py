@@ -110,18 +110,76 @@ def update_perception_output_dim(model):
         model.perception.proj = torch.nn.Linear(proj.in_features, hidden_size, bias=proj.bias is not None)
 
 
+def find_embedding_layer(llm):
+    """
+    Locate the input embedding layer of an HF causal LM across architectures.
+
+    Returns ``(parent_module, attr_name)`` so callers can get/set/delete the
+    embedding via ``getattr``/``setattr``/``delattr``, or ``(None, None)`` if no
+    known location matches. The parent (and attr name) is returned even when the
+    attribute is currently absent (e.g. it was deleted to save memory), so the
+    same location can be restored later.
+    """
+    # (parent_path..., attr) candidates for common architectures.
+    paths_to_try = [
+        ['backbone', 'embeddings'],  # NemotronH
+        ['model', 'embed_tokens'],  # Llama, Mistral, Qwen, standard Nemotron
+        ['transformer', 'wte'],  # GPT-2
+        ['gpt_neox', 'embed_in'],  # GPT-NeoX
+        ['decoder', 'embed_tokens'],  # BART, T5
+    ]
+    # Unwrap PeftModel (LoRA) to reach the underlying base model.
+    if isinstance(llm, PeftModel):
+        llm = llm.base_model.model
+    for *parents, attr in paths_to_try:
+        obj = llm
+        for name in parents:
+            obj = getattr(obj, name, None)
+            if obj is None:
+                break
+        else:
+            return obj, attr
+    return None, None
+
+
+def delete_embeddings(llm) -> bool:
+    """
+    Delete the input embedding layer from ``llm`` (it is "moved out" to the
+    top-level module to avoid messing up FSDP/TP hooks). Returns ``True`` if an
+    embedding was found and deleted, ``False`` otherwise.
+    """
+    parent, attr_name = find_embedding_layer(llm)
+    if parent is not None and attr_name is not None and hasattr(parent, attr_name):
+        delattr(parent, attr_name)
+        return True
+    return False
+
+
 @contextmanager
 def move_embedding(model):
-    """Temporarily restores the embedding layer into HF LLM. Supports LoRA models."""
-    if isinstance(model.llm, PeftModel):
-        model.llm.base_model.model.model.embed_tokens = model.embed_tokens
-    else:
-        model.llm.model.embed_tokens = model.embed_tokens
-    yield
-    if isinstance(model.llm, PeftModel):
-        del model.llm.base_model.model.model.embed_tokens
-    else:
-        del model.llm.model.embed_tokens
+    """
+    Temporarily restore the embedding layer into the HF LLM for generation, then
+    return it to its previous state. Works across architectures and supports LoRA
+    (PeftModel) wrappers.
+    """
+    parent, attr_name = find_embedding_layer(model.llm)
+    if parent is None or attr_name is None:
+        logging.warning(
+            f"move_embedding: could not locate the embedding layer on {type(model.llm).__name__}; "
+            "proceeding without restoring embeddings."
+        )
+        yield
+        return
+    # The embedding may be absent (deleted at init) — remember so we can restore that state.
+    original_embed = getattr(parent, attr_name, None)
+    try:
+        setattr(parent, attr_name, model.embed_tokens)
+        yield
+    finally:
+        if original_embed is not None:
+            setattr(parent, attr_name, original_embed)
+        elif hasattr(parent, attr_name):
+            delattr(parent, attr_name)
 
 
 def setup_audio_codec(model: torch.nn.Module):

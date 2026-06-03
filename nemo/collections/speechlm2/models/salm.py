@@ -44,6 +44,7 @@ from nemo.collections.speechlm2.parts.input_utils import _unpad_inputs
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
 from nemo.collections.speechlm2.parts.pretrained import (
+    delete_embeddings,
     load_pretrained_hf,
     maybe_load_pretrained_models,
     move_embedding,
@@ -64,6 +65,16 @@ class SALM(LightningModule, HFHubMixin):
         self.cfg = DictConfig(cfg)
         self.audio_locator_tag = self.cfg.audio_locator_tag
 
+        # Resolve the configured compute dtype for the LLM (defaults to float32 if unset/unknown).
+        dtype_str = str(self.cfg.get("dtype", "float32")).lower()
+        torch_dtype = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+        }.get(dtype_str, torch.float32)
+
         tokenizer_src = self.cfg.get("tokenizer_path", None) or self.cfg.pretrained_llm
         self.tokenizer = AutoTokenizer(
             tokenizer_src, use_fast=True, trust_remote_code=self.cfg.get("trust_remote_code", False)
@@ -72,12 +83,19 @@ class SALM(LightningModule, HFHubMixin):
         self.llm = load_pretrained_hf(
             self.cfg.pretrained_llm,
             pretrained_weights=self.cfg.pretrained_weights,
+            dtype=torch_dtype,
             trust_remote_code=self.cfg.get("trust_remote_code", False),
         )
         # Note: we have to "move out" the token embedding outside of LLM to avoid
-        #       messing up FSDP/TP hooks.
-        self.embed_tokens = self.llm.model.embed_tokens
-        del self.llm.model.embed_tokens
+        #       messing up FSDP/TP hooks. Use architecture-agnostic helpers so models
+        #       whose embeddings are not at ``llm.model.embed_tokens`` (e.g. Luciole 8B)
+        #       are also supported.
+        self.embed_tokens = self.llm.get_input_embeddings()
+        if not delete_embeddings(self.llm):
+            logging.warning(
+                f"Could not locate/delete the input embedding layer on {type(self.llm).__name__}; "
+                "it may remain duplicated in memory."
+            )
 
         maybe_install_lora(self)
         # Load the pretrained streaming ASR model and copy its parameters into the audio perception module.
