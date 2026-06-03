@@ -354,8 +354,8 @@ def oomptimizer(
 
     \b
     The suggested workflow is the following:
-    1) Run scripts/speech_recognition/estimate_duration_bins.py to get the duration distribution of your data.
-        (consider running estimate_duration_bins_2d.py for models with a strong dependency on output sequence length
+    1) Run scripts/speechlm2/estimate_token_bins.py to get the token distribution of your data.
+        (consider running it with --sub-buckets for models with a strong dependency on output sequence length
         such as attention-encoder-decoder models).
     2) Run OOMptimizer to find the optimal batch sizes for your specific model, optimizer, and GPU.
     3) Use these optimal settings in your actual training script and enjoy optimal GPU utilization OOM-free.
