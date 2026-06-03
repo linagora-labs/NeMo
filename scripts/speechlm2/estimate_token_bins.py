@@ -128,6 +128,16 @@ def parse_args():
         help="If specified, we'll filter out examples with more output tokens per input token than this.",
     )
     parser.add_argument(
+        "--tail-step",
+        type=float,
+        default=0.0,
+        help="(1D mode only) Multiplicative growth factor between consecutive tail bins. When > 1, "
+        "log-spaced intermediate bins are inserted across the (often large) gap between the last "
+        "dense bin and the tail, so long-tail examples get their own bins (each ~tail-step times the "
+        "previous) instead of being merged into the last dense bucket. If --max_tokens is finite, the "
+        "tail is extended up to that cap. Set to 0 (default) to disable.",
+    )
+    parser.add_argument(
         "--min_duration",
         type=float,
         default=-float("inf"),
@@ -242,12 +252,32 @@ def find_non_outliers_z_score(data, threshold=4.0):
     return np.where(z_scores <= threshold)
 
 
+def _log_spaced_tail_bins(last_dense: int, tail: int, step: float) -> list[int]:
+    """Return log-spaced bin boundaries strictly between *last_dense* and *tail*.
+
+    The number of bins is derived from the ratio ``floor(log(tail/last_dense) / log(step))``,
+    so each successive bin is roughly ``step`` times the previous one. Returns an empty list
+    when a tail is not warranted (non-positive inputs, ``tail <= last_dense``, or ``step <= 1``).
+    """
+    if step <= 1.0 or last_dense <= 0 or tail <= last_dense:
+        return []
+    num_bins = int(math.log(tail / last_dense) / math.log(step))
+    if num_bins <= 0:
+        return []
+    # geomspace includes both endpoints; strip them (the caller owns last_dense and tail).
+    points = np.geomspace(last_dense, tail, num=num_bins + 2)
+    int_points = sorted(set(int(round(p)) for p in points))
+    return [p for p in int_points if last_dense < p < tail]
+
+
 def estimate_token_buckets_1d(
     cuts: Iterable[Cut],
     num_buckets: int,
     token_equivalent_duration: float,
     measure_total_length: bool,
     quiet: bool,
+    max_tokens: float | None = None,
+    tail_step: float = 0.0,
 ) -> list[int]:
     """1D bucketing: equal-token-mass bins along a single input-length axis.
 
@@ -255,6 +285,13 @@ def estimate_token_buckets_1d(
     MultimodalSamplingConstraint, which converts audio cuts to tokens through
     token_equivalent_duration and (optionally) sums context+answer when
     measure_total_length=True.
+
+    When ``tail_step > 1`` (see --tail-step), log-spaced intermediate bins are
+    inserted across the gap between the last dense bin and the tail so that the
+    long tail of the distribution gets dedicated buckets instead of being merged
+    into the last dense bucket. Dense bins are trimmed from the end to keep the
+    total count near ``num_buckets``. When disabled (default), the behavior is the
+    classic equal-mass binning capped by the largest observed length.
     """
     assert num_buckets > 1
     constraint = MultimodalSamplingConstraint(
@@ -281,7 +318,28 @@ def estimate_token_buckets_1d(
             bins.append(int(size))
             tot = 0
         tot += size
-    bins.append(int(sizes[-1]))
+
+    tail = int(sizes[-1])
+    if tail_step and tail_step > 1.0:
+        # Optionally extend the tail up to the user-provided --max_tokens cap so examples
+        # between the max observed length and the cap also land in a real bucket.
+        if max_tokens is not None and math.isfinite(max_tokens):
+            tail = max(tail, int(max_tokens))
+        last_dense = bins[-1] if bins else 0
+        intermediate = _log_spaced_tail_bins(last_dense, tail, tail_step)
+        # Trim dense bins from the end to make room for the tail bins, keeping the total
+        # bucket count near num_buckets (but always at least one dense bin).
+        n_to_trim = min(len(intermediate), len(bins) - 1)
+        if n_to_trim > 0:
+            del bins[-n_to_trim:]
+            last_dense = bins[-1] if bins else 0
+            intermediate = _log_spaced_tail_bins(last_dense, tail, tail_step)
+        if intermediate and not quiet:
+            print(f"Inserting {len(intermediate)} log-spaced tail bins: {intermediate}")
+        bins.extend(intermediate)
+
+    if not bins or bins[-1] < tail:
+        bins.append(tail)
     return bins
 
 
@@ -608,6 +666,8 @@ def main():
             token_equivalent_duration=args.token_equivalent_duration,
             measure_total_length=args.measure_total_length,
             quiet=args.quiet,
+            max_tokens=args.max_tokens,
+            tail_step=args.tail_step,
         )
 
     if args.quantize_bins != "none":
