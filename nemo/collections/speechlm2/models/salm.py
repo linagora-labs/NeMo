@@ -52,6 +52,7 @@ from nemo.collections.speechlm2.parts.pretrained import (
 )
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, MaskType, NeuralType
 from nemo.utils import logging
+from nemo.utils.dtype import str_to_dtype
 
 
 class SALM(LightningModule, HFHubMixin):
@@ -65,15 +66,8 @@ class SALM(LightningModule, HFHubMixin):
         self.cfg = DictConfig(cfg)
         self.audio_locator_tag = self.cfg.audio_locator_tag
 
-        # Resolve the configured compute dtype for the LLM (defaults to float32 if unset/unknown).
-        dtype_str = str(self.cfg.get("dtype", "float32")).lower()
-        torch_dtype = {
-            "float32": torch.float32,
-            "float16": torch.float16,
-            "fp16": torch.float16,
-            "bf16": torch.bfloat16,
-            "bfloat16": torch.bfloat16,
-        }.get(dtype_str, torch.float32)
+        # Resolve the configured compute dtype for the LLM (defaults to float32 if unset).
+        torch_dtype = str_to_dtype(self.cfg.get("dtype", "float32"))
 
         tokenizer_src = self.cfg.get("tokenizer_path", None) or self.cfg.pretrained_llm
         self.tokenizer = AutoTokenizer(
