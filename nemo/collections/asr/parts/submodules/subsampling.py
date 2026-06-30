@@ -458,8 +458,6 @@ class ConvSubsampling(torch.nn.Module):
         if not self.conv2d_subsampling:
             x = x.transpose(1, 2)
 
-        assert self.subsampling_conv_chunking_factor == 1
-        logging.info(f"{self.subsampling_conv_chunking_factor=}")
         # split inputs if chunking_factor is set
         if self.subsampling_conv_chunking_factor != -1 and self.conv2d_subsampling:
             if self.subsampling_conv_chunking_factor == 1:
