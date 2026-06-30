@@ -184,13 +184,20 @@ class SALM(LightningModule, HFHubMixin):
         # Source audio encoding.
         # Input audio: (B, T_samples)
         # Audio embeddings: (B, T, H)
-        audio_embs = encode_audio_with_optional_chunking(
-            self.perception,
-            batch["audios"],
-            batch["audio_lens"],
-            chunk_size_seconds=self.cfg.get("encoder_chunk_size_seconds", None),
-            sampling_rate=self.sampling_rate,
-        )
+        try:
+            audio_embs = encode_audio_with_optional_chunking(
+                self.perception,
+                batch["audios"],
+                batch["audio_lens"],
+                chunk_size_seconds=self.cfg.get("encoder_chunk_size_seconds", None),
+                sampling_rate=self.sampling_rate,
+            )
+        except Exception as e:
+            ids = [getattr(c, "id", "?") for c in (batch.get("conversations") or [])]
+            lens = batch["audio_lens"].tolist()
+            logging.error(f"Audio encoding failed ({type(e).__name__}: {e}). Full batch: {batch}")
+            logging.error(f"Audio encoding failed ({type(e).__name__}: {e}). ids={ids} audio_lens={lens}")
+            raise Exception(f"Audio encoding failed {ids=}")
         input_ids_to_embed = torch.where(batch["input_ids"] == self.audio_locator_tag_id, 0, batch["input_ids"])
         text_embs = self.embed_tokens(input_ids_to_embed)
         input_embs, target_ids, attention_mask = replace_placeholders_and_build_targets(
