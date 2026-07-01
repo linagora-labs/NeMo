@@ -1211,8 +1211,9 @@ def _emit_profile(profile: dict, buckets, memory_fraction: float, ddp: bool, dty
     click.secho(f"* {'' if ddp else 'not '}simulating DDP memory overhead.")
     click.secho(f"* using AMP with dtype={dtype}.")
     click.secho("The final profile is:", bold=True)
-    click.secho("\tbucket_duration_bins=[" + ",".join(str(seqlen) for seqlen, bs in final_profile) + "]", bold=True)
-    click.secho("\tbucket_batch_size=[" + ",".join(str(bs) for seqlen, bs in final_profile) + "]", bold=True)
+    click.secho("\tnum_buckets: " + str(len(final_profile)), bold=True)
+    click.secho("\tbucket_duration_bins: [" + ",".join(str(seqlen) for seqlen, bs in final_profile) + "]", bold=True)
+    click.secho("\tbucket_batch_size: [" + ",".join(str(bs) for seqlen, bs in final_profile) + "]", bold=True)
 
 
 def _is_oom_like(error: RuntimeError) -> bool:
