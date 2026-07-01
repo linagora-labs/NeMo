@@ -195,9 +195,8 @@ class SALM(LightningModule, HFHubMixin):
         except Exception as e:
             ids = [getattr(c, "id", "?") for c in (batch.get("conversations") or [])]
             lens = batch["audio_lens"].tolist()
-            logging.error(f"Audio encoding failed ({type(e).__name__}: {e}). Full batch: {batch}")
-            logging.error(f"Audio encoding failed ({type(e).__name__}: {e}). ids={ids} audio_lens={lens}")
-            raise Exception(f"Audio encoding failed {ids=}")
+            logging.error(f"Audio encoding failed ({type(e).__name__}: {e}). Full batch: {batch.get("conversations")}")
+            raise Exception(f"Audio encoding failed {ids=} {lens=}")
         input_ids_to_embed = torch.where(batch["input_ids"] == self.audio_locator_tag_id, 0, batch["input_ids"])
         text_embs = self.embed_tokens(input_ids_to_embed)
         input_embs, target_ids, attention_mask = replace_placeholders_and_build_targets(
