@@ -591,6 +591,10 @@ class DistributedSearchState:
     max_ok: int | None = None
     min_err: int | None = None
     ok_points: list[tuple[int, int]] = field(default_factory=list)
+    # Which per-probe memory statistic drives the slope prediction toward target_memory.
+    # "peak_reserved" is conservative (matches how real CUDA OOM is triggered); "peak_allocated"
+    # is the older, more optimistic behavior. Falls back to peak_allocated for old resume records.
+    memory_metric: str = "peak_reserved"
 
     @property
     def finished(self) -> bool:
@@ -629,7 +633,7 @@ class DistributedSearchState:
         events = []
         for record in records:
             batch_size = int(record["batch_size"])
-            peak_allocated = int(record.get("peak_allocated", 0))
+            peak_allocated = int(record.get(self.memory_metric, record.get("peak_allocated", 0)))
             status = record["status"]
             if status == "ok":
                 self.max_ok = max(batch_size, -1 if self.max_ok is None else self.max_ok)
@@ -710,6 +714,7 @@ class TorchrunProbeLauncher:
     memory_fraction: float
     dtype: str
     ddp: bool
+    profile_memory: str
     salm_audio_token_ratio: float
     distributed_timeout_seconds: float
     probe_timeout_seconds: float
@@ -767,6 +772,8 @@ class TorchrunProbeLauncher:
                 str(self.memory_fraction),
                 "--dtype",
                 self.dtype,
+                "--profile-memory",
+                self.profile_memory,
                 "--salm-audio-token-ratio",
                 str(self.salm_audio_token_ratio),
                 "--distributed-timeout-seconds",
@@ -969,6 +976,36 @@ def _supervisor_run_id() -> str:
     return slurm_id or str(os.getpid())
 
 
+def _load_resume_records(resume_from: str) -> dict[float, list[dict]]:
+    """Load prior probe results grouped by bucket value for ``--resume-from``.
+
+    Scans ``resume_from`` recursively for ``probe_*.jsonl`` files so it can read across multiple
+    job-unique probe directories (e.g. the parent of several ``${SLURM_JOB_ID}`` dirs). Records are
+    returned ordered by probe file name to preserve the original search order. Malformed lines and
+    non-numeric (2D) buckets are skipped rather than raising, so a resume never crashes on bad input.
+    """
+    root = Path(resume_from)
+    by_bucket: dict[float, list[dict]] = {}
+    if not root.exists():
+        return by_bucket
+    for path in sorted(root.rglob("probe_*.jsonl")):
+        try:
+            lines = path.read_text().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+                bucket = float(record["bucket"])
+            except (ValueError, TypeError, KeyError):
+                continue
+            by_bucket.setdefault(bucket, []).append(record)
+    return by_bucket
+
+
 def _run_distributed_supervisor(
     *,
     pretrained_name: str | None,
@@ -981,6 +1018,7 @@ def _run_distributed_supervisor(
     memory_fraction: float,
     dtype: str,
     ddp: bool,
+    profile_memory: str,
     salm_audio_token_ratio: float,
     distributed_timeout_seconds: float,
     nproc_per_node: int | None,
@@ -992,6 +1030,7 @@ def _run_distributed_supervisor(
     probe_memory_reclaim_timeout_seconds: float,
     probe_memory_tolerance_mb: int,
     max_probe_retries: int,
+    resume_from: str | None = None,
 ) -> None:
     assert pretrained_name is None, "--pretrained-name is not supported yet for Duplex S2S"
     assert config_path is not None, "--module-name requires --config-path to be specified as well."
@@ -1063,12 +1102,20 @@ def _run_distributed_supervisor(
         memory_fraction=memory_fraction,
         dtype=dtype,
         ddp=ddp,
+        profile_memory=profile_memory,
         salm_audio_token_ratio=salm_audio_token_ratio,
         distributed_timeout_seconds=distributed_timeout_seconds,
         probe_timeout_seconds=probe_timeout_seconds,
         log_dir=log_dir,
         run_id=supervisor_run_id,
     )
+    resume_records = _load_resume_records(resume_from) if resume_from else {}
+    if resume_records and is_primary_supervisor:
+        click.secho(
+            f"Resuming from {resume_from}: found prior probe records for {len(resume_records)} bucket(s).",
+            fg="cyan",
+        )
+
     profile = {}
     next_start = max(1, start_batch_size)
     probe_index = 0
@@ -1076,7 +1123,38 @@ def _run_distributed_supervisor(
     for bucket, (seq_len_in, seq_len_out) in reversed(list(zip(buckets, max_seq_lens))):
         if is_primary_supervisor:
             click.echo(f"The current sequence lengths are: input={seq_len_in} output={seq_len_out}.")
-        search = DistributedSearchState(current=next_start, threshold=threshold, target_memory=target_memory)
+        search = DistributedSearchState(
+            current=next_start,
+            threshold=threshold,
+            target_memory=target_memory,
+            memory_metric=("peak_reserved" if profile_memory == "reserved" else "peak_allocated"),
+        )
+
+        prior = None
+        try:
+            prior = resume_records.get(float(bucket))
+        except (TypeError, ValueError):
+            prior = None
+        if prior:
+            search.apply_records(prior)
+            search.record_batch_size_one_failure()
+            if search.finished:
+                if is_primary_supervisor:
+                    click.secho(
+                        f"=> Resumed bucket={bucket}: already complete, max_batch_size={search.max_ok}",
+                        fg="cyan",
+                    )
+                profile[(bucket, seq_len_in, seq_len_out)] = search.max_ok
+                if search.max_ok is not None:
+                    next_start = max(search.max_ok + 1, int(math.ceil(search.max_ok * 1.5)))
+                continue
+            search.advance()
+            if is_primary_supervisor:
+                click.secho(
+                    f"Resumed bucket={bucket}: continuing search from prior records "
+                    f"(max_ok={search.max_ok}, min_err={search.min_err}, next batch={search.current}).",
+                    fg="cyan",
+                )
 
         while not search.finished:
             plan = search.make_plan()
@@ -1182,10 +1260,12 @@ def _run_distributed_supervisor(
         next_start = max(search.max_ok + 1, int(math.ceil(search.max_ok * 1.5)))
 
     if is_primary_supervisor:
-        _emit_profile(profile, buckets, memory_fraction, ddp, dtype)
+        _emit_profile(profile, buckets, memory_fraction, ddp, dtype, profile_memory)
 
 
-def _emit_profile(profile: dict, buckets, memory_fraction: float, ddp: bool, dtype: str) -> None:
+def _emit_profile(
+    profile: dict, buckets, memory_fraction: float, ddp: bool, dtype: str, profile_memory: str = "reserved"
+) -> None:
     profile = dict(reversed(list(profile.items())))
     click.echo("The 1st stage profile is:")
     for (bucket, seq_len_in, seq_len_out), bs in profile.items():
@@ -1196,11 +1276,20 @@ def _emit_profile(profile: dict, buckets, memory_fraction: float, ddp: bool, dty
     else:
         click.echo("Bucket merging stage...")
         final_profile = []
+        # Enforce a monotonically non-increasing batch size over ascending buckets. Each bucket is
+        # searched independently, so measurement noise can leak an over-estimate where a larger bucket
+        # ends up with a bigger batch size than a smaller one (physically impossible) -- those OOM in
+        # real training. Clamp each bucket to the previous (smaller) bucket's batch size.
+        prev_bs = None
         for idx, ((bucket, seq_len_in, seq_len_out), bs) in enumerate(profile.items()):
-            if idx == 0:
-                final_profile.append([bucket, bs])
-                continue
-            if bs == final_profile[-1][1]:
+            if prev_bs is not None and bs is not None and bs > prev_bs:
+                click.secho(
+                    f"Clamping bucket {idx} batch size {bs} -> {prev_bs} to keep the profile monotonic.",
+                    fg="yellow",
+                )
+                bs = prev_bs
+            prev_bs = bs
+            if final_profile and bs == final_profile[-1][1]:
                 click.echo(f"Merging bucket {idx} with bucket {idx-1} due to identical batch sizes.")
                 final_profile[-1][0] = bucket
                 continue
@@ -1209,6 +1298,7 @@ def _emit_profile(profile: dict, buckets, memory_fraction: float, ddp: bool, dty
     click.secho(f"The profile was created with the following settings:")
     click.secho(f"* using {memory_fraction:.1%} of available GPU RAM.")
     click.secho(f"* {'' if ddp else 'not '}simulating DDP memory overhead.")
+    click.secho(f"* stopping the search on peak {profile_memory} memory.")
     click.secho(f"* using AMP with dtype={dtype}.")
     click.secho("The final profile is:", bold=True)
     click.secho("\tnum_buckets: " + str(len(final_profile)), bold=True)
@@ -1281,6 +1371,14 @@ def _is_oom_like(error: RuntimeError) -> bool:
     help="Limits the use of CUDA memory for this process to MEMORY_FRACTION of the total device memory. "
     "By default we force 5% memory to be unused to account for non-training-loop related CUDA memory usage"
     "in actual training scripts.",
+)
+@click.option(
+    "--profile-memory",
+    type=click.Choice(["allocated", "reserved"]),
+    default="reserved",
+    help="Which CUDA memory statistic the search uses as the stopping criterion. 'reserved' (default) is "
+    "conservative: real CUDA OOM is driven by reserved memory + fragmentation, which is always >= allocated. "
+    "'allocated' reproduces the older, more optimistic behavior.",
 )
 @click.option(
     "-y",
@@ -1366,6 +1464,14 @@ def _is_oom_like(error: RuntimeError) -> bool:
     default=2,
     help="Number of retries for child probes that fail without an explicit OOM or memory result.",
 )
+@click.option(
+    "--resume-from",
+    type=str,
+    default=None,
+    help="Directory scanned recursively for prior probe_*.jsonl results. Buckets already fully searched are "
+    "skipped and partially-searched buckets continue from their last known state. Point this at the parent of "
+    "your job-unique --probe-log-dir to resume across restarts. Only applies to the distributed supervisor.",
+)
 @click.option("--probe-batch-sizes", type=str, default=None, hidden=True)
 @click.option("--probe-seq-len-in", type=int, default=None, hidden=True)
 @click.option("--probe-seq-len-out", type=int, default=None, hidden=True)
@@ -1380,6 +1486,7 @@ def oomptimizer(
     start_batch_size: int,
     ratio: float,
     memory_fraction: float,
+    profile_memory: str,
     dtype: str,
     ddp: bool,
     salm_audio_token_ratio: float,
@@ -1394,6 +1501,7 @@ def oomptimizer(
     probe_memory_reclaim_timeout_seconds: float,
     probe_memory_tolerance_mb: int,
     max_probe_retries: int,
+    resume_from: str | None,
     probe_batch_sizes: str | None,
     probe_seq_len_in: int | None,
     probe_seq_len_out: int | None,
@@ -1460,6 +1568,7 @@ def oomptimizer(
                 memory_fraction=memory_fraction,
                 dtype=dtype,
                 ddp=ddp,
+                profile_memory=profile_memory,
                 salm_audio_token_ratio=salm_audio_token_ratio,
                 distributed_timeout_seconds=distributed_timeout_seconds,
                 nproc_per_node=nproc_per_node,
@@ -1471,6 +1580,7 @@ def oomptimizer(
                 probe_memory_reclaim_timeout_seconds=probe_memory_reclaim_timeout_seconds,
                 probe_memory_tolerance_mb=probe_memory_tolerance_mb,
                 max_probe_retries=max_probe_retries,
+                resume_from=resume_from,
             )
             return
     logging.setLevel(logging.CRITICAL)
@@ -1507,9 +1617,23 @@ def oomptimizer(
             "val_check_interval": 0.0,
         }
     )
+    # Keep extra full model copies resident on the GPU to approximate PyTorch DDP's gradient-buffer /
+    # NCCL overhead. A single manual training step never allocates the reduction buckets and comm
+    # buffers that real DDP holds, which is a common reason OOMptimizer batch sizes still OOM in
+    # training. This mirrors PR #15856's ``simulate_ddp`` (extra model clone) but for the distributed
+    # tool. Note this is a conservative proxy: a full clone includes frozen params, so it over-counts
+    # for frozen-heavy setups (e.g. frozen LLM + trainable encoder) -- that errs on the safe side.
+    model_config = OmegaConf.to_container(cfg.model, resolve=True)
+    ddp_overhead_models = []
     with trainer.init_module():
-        model = model_cls(OmegaConf.to_container(cfg.model, resolve=True))
+        model = model_cls(model_config)
+        if ddp:
+            ddp_overhead_models.append(model_cls(model_config))
     model = model.to(device)
+    for overhead_model in ddp_overhead_models:
+        overhead_model.to(device)
+    if ddp:
+        click.echo(f"Simulating DDP overhead: keeping {len(ddp_overhead_models)} extra model copy(ies) resident.")
 
     if not hasattr(model, "oomptimizer_schema"):
         click.secho(
@@ -1568,6 +1692,7 @@ def oomptimizer(
             bucket=probe_bucket,
             distributed=distributed,
             device=device,
+            profile_memory=profile_memory,
         ).run()
         return
 
@@ -1656,7 +1781,7 @@ def oomptimizer(
             profile[(bucket, seq_len_in, seq_len_out)] = gen.max_batch_size
             gen.start_batch_size = gen.max_batch_size * 2
 
-    _emit_profile(profile, buckets, memory_fraction, ddp, dtype)
+    _emit_profile(profile, buckets, memory_fraction, ddp, dtype, profile_memory)
 
 
 @dataclass
@@ -1672,6 +1797,7 @@ class ProbeWorkerRunner:
     bucket: str | None
     distributed: bool
     device: torch.device
+    profile_memory: str = "reserved"
 
     def run(self) -> None:
         global_rank = int(os.environ.get("RANK", "0"))
@@ -1720,7 +1846,8 @@ class ProbeWorkerRunner:
                         click.echo(f"OOMPTIMIZER_PROBE_COLLECTIVE_FAILED batch_size={batch_size}: {e}")
                         os._exit(44)
 
-                status = "memory_target" if peak_allocated >= self.target_memory else "ok"
+                peak_metric = peak_reserved if self.profile_memory == "reserved" else peak_allocated
+                status = "memory_target" if peak_metric >= self.target_memory else "ok"
                 if global_rank == 0:
                     ProbeStore.append_record_to_path(
                         self.result_path,
