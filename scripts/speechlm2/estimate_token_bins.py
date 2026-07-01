@@ -46,6 +46,7 @@ import pandas as pd
 import yaml
 from lhotse.cut import Cut
 from omegaconf import OmegaConf
+from tqdm import tqdm
 
 import nemo.collections.speechlm2.data.salm_dataset  # noqa: F401  (registers lhotse_as_conversation)
 from nemo.collections.asr.data.audio_to_text_lhotse import TokenizerWrapper
@@ -278,6 +279,7 @@ def estimate_token_buckets_1d(
     quiet: bool,
     max_tokens: float | None = None,
     tail_step: float = 0.0,
+    total: int | None = None,
 ) -> list[int]:
     """1D bucketing: equal-token-mass bins along a single input-length axis.
 
@@ -300,8 +302,16 @@ def estimate_token_buckets_1d(
     )
 
     sizes = []
-    for c in cuts:
-        sizes.append(constraint.measure_length(c))
+    n_failed = 0
+    for c in tqdm(cuts, total=total, desc="Tokenizing cuts (1D)", disable=quiet, mininterval=5.0):
+        try:
+            sizes.append(constraint.measure_length(c))
+        except Exception as e:
+            n_failed += 1
+            if n_failed <= 20:
+                print(f"[WARN] skipping cut id={getattr(c, 'id', '?')}: {type(e).__name__}: {e}", flush=True)
+    if n_failed:
+        print(f"[WARN] skipped {n_failed} cuts that failed length measurement.", flush=True)
     sizes = np.array(sizes, dtype=np.int32)
     sizes.sort()
 
@@ -351,6 +361,7 @@ def estimate_token_buckets_2d(
     measure_total_length: bool,
     token_outlier_threshold: float,
     quiet: bool,
+    total: int | None = None,
 ) -> list[tuple[int, int]]:
     """2D bucketing on (input_tokens, output_tokens) with per-bucket TPT outlier filtering.
 
@@ -374,10 +385,19 @@ def estimate_token_buckets_2d(
 
     num_input_tokens = []
     num_output_tokens = []
-    for c in cuts:
-        itoks, otoks = constraint.measure_length(c)
+    n_failed = 0
+    for c in tqdm(cuts, total=total, desc="Tokenizing cuts (2D)", disable=quiet, mininterval=5.0):
+        try:
+            itoks, otoks = constraint.measure_length(c)
+        except Exception as e:
+            n_failed += 1
+            if n_failed <= 20:
+                print(f"[WARN] skipping cut id={getattr(c, 'id', '?')}: {type(e).__name__}: {e}", flush=True)
+            continue
         num_input_tokens.append(itoks)
         num_output_tokens.append(otoks)
+    if n_failed:
+        print(f"[WARN] skipped {n_failed} cuts that failed length measurement.", flush=True)
     num_input_tokens = np.array(num_input_tokens, dtype=np.int32)
     num_output_tokens = np.array(num_output_tokens, dtype=np.int32)
 
@@ -484,11 +504,12 @@ def estimate_token_buckets_2d(
 def load_tokenizer(paths: list[str], langs: list[str] = None) -> TokenizerWrapper:
     if len(paths) == 1:
         (p,) = paths
-        if Path(p).exists():
+        if Path(p).is_file():
             tok = SentencePieceTokenizer(p)
         else:
-            # Assume HuggingFace repo id; trust_remote_code is required for
-            # custom tokenizers (e.g. nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16).
+            # A local directory (HuggingFace tokenizer saved with save_pretrained) or a
+            # HuggingFace repo id. trust_remote_code is required for custom tokenizers
+            # (e.g. nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16).
             tok = AutoTokenizer(p, use_fast=True, trust_remote_code=True)
     else:
         assert langs is not None and len(paths) == len(langs), (
@@ -645,8 +666,10 @@ def main():
     cuts = cuts.filter(token_filter)
     tpt_filter = RejectionsCounter(TokenPerTokenFilter(-1, args.max_tpt), "Output tokens per input token filtering")
     cuts = cuts.filter(tpt_filter)
+    total = None
     if (N := args.num_examples) > 0:
         cuts = islice(cuts, N)
+        total = N
 
     is_2d = args.sub_buckets is not None
     if is_2d:
@@ -658,6 +681,7 @@ def main():
             measure_total_length=args.measure_total_length,
             token_outlier_threshold=args.token_outlier_threshold,
             quiet=args.quiet,
+            total=total,
         )
     else:
         bins = estimate_token_buckets_1d(
@@ -668,6 +692,7 @@ def main():
             quiet=args.quiet,
             max_tokens=args.max_tokens,
             tail_step=args.tail_step,
+            total=total,
         )
 
     if args.quantize_bins != "none":
