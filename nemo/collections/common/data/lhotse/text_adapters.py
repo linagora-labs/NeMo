@@ -561,6 +561,21 @@ def default_multimodal_conversation_prompt_format_fn(example: NeMoMultimodalConv
     return prompt.encode_dialog(turns, **prompt_kwargs)
 
 
+def _dataset_slug_from_manifest(manifest_path, depth: int = 4) -> str:
+    """Derive a short, stable, dataset-identifying slug from a manifest path.
+
+    Uses the last ``depth`` parent-directory components (typically task/lang/dataset,
+    plus one shard-dir layer for sharded manifests) so that cut ids are unique across
+    datasets that reuse the same audio basenames (e.g. ``012551.wav`` shared by
+    CommonVoice-derived corpora) and across languages that reuse the same dataset folder
+    name. Prevents id collisions in the fault-tolerant minibatch
+    collation, which keys surviving cuts by id. Returns ``""`` when no path is available.
+    """
+    if not manifest_path:
+        return ""
+    return "_".join(Path(str(manifest_path)).parent.parts[-depth:])
+
+
 def _make_url_cut(
     tar_path: str,
     audio_filename: str,
@@ -652,12 +667,14 @@ class NeMoMultimodalConversationJsonlAdapter:
         seed = resolve_seed(self.shard_seed) + self.epoch
         return random.Random(seed)
 
-    def _make_cut_id(self, cut, turn) -> str:
+    def _make_cut_id(self, cut, turn, manifest_path=None) -> str:
         offset = turn.get('offset') if turn.get('offset') else cut.start
         duration = turn.get('duration') if turn.get('duration') else cut.duration
+        slug = _dataset_slug_from_manifest(manifest_path)
+        prefix = f"{slug}__" if slug else ""
         if offset > 0.0:
-            return f"{Path(turn['value']).stem}_{offset:.3f}_{duration:.3f}"
-        return Path(turn['value']).stem
+            return f"{prefix}{Path(turn['value']).stem}_{offset:.3f}_{duration:.3f}"
+        return f"{prefix}{Path(turn['value']).stem}"
 
     def _iter_tar(self):
         # In GetBatch mode we do not open the tar; the manifest's audio path is trusted to match
@@ -690,14 +707,14 @@ class NeMoMultimodalConversationJsonlAdapter:
                             offset=turn.get('offset', 0.0),
                             sampling_rate=turn.get('sampling_rate', 16000),
                         )
-                        cut = cut.with_id(self._make_cut_id(cut, turn))
+                        cut = cut.with_id(self._make_cut_id(cut, turn, jsonl_path))
                     else:
                         recording, audio_path = next(tar)
                         audio_path = str(audio_path)
                         cut = recording.to_cut().truncate(
                             offset=turn.get("offset", 0.0), duration=turn.get("duration")
                         )
-                        cut = cut.with_id(self._make_cut_id(cut, turn))
+                        cut = cut.with_id(self._make_cut_id(cut, turn, jsonl_path))
                         assert audio_path == turn['value'], (
                             f"Mismatch between JSONL and tar. JSONL defines audio path={turn['value']} but we got "
                             f"the following from tar {audio_path=}.\nBad inputs in: {jsonl_path=} {tar_path=}"
@@ -765,7 +782,7 @@ class NeMoMultimodalConversationJsonlAdapter:
                                 cut := Recording.from_file(get_full_path(turn["value"], path))
                                 .to_cut()
                                 .truncate(offset=turn.get("offset", 0.0), duration=turn.get("duration"))
-                            ).with_id(self._make_cut_id(cut, turn)),
+                            ).with_id(self._make_cut_id(cut, turn, path)),
                             text=cut.supervisions[0].text if cut.supervisions else None,
                             role=turn["from"].lower(),
                             audio_locator_tag=self.audio_locator_tag,
@@ -901,12 +918,14 @@ class NeMoMultimodalConversationShareGPTJsonlAdapter:
     def _get_rng(self) -> random.Random:
         return random.Random(resolve_seed(self.shard_seed) + self.epoch)
 
-    def _make_cut_id(self, cut, turn) -> str:
+    def _make_cut_id(self, cut, turn, manifest_path=None) -> str:
         offset = turn.get('offset') if turn.get('offset') else cut.start
         duration = turn.get('duration') if turn.get('duration') else cut.duration
+        slug = _dataset_slug_from_manifest(manifest_path)
+        prefix = f"{slug}__" if slug else ""
         if offset > 0.0:
-            return f"{Path(turn['value']).stem}_{offset:.3f}_{duration:.3f}"
-        return Path(turn['value']).stem
+            return f"{prefix}{Path(turn['value']).stem}_{offset:.3f}_{duration:.3f}"
+        return f"{prefix}{Path(turn['value']).stem}"
 
     def _resolve_cut_from_path(self, turn, manifest_path):
         if is_valid_url(turn["value"]):
@@ -916,7 +935,9 @@ class NeMoMultimodalConversationShareGPTJsonlAdapter:
             cut = Recording.from_file(get_full_path(turn["value"], data_dir=self.audio_root)).to_cut()
         else:
             cut = Recording.from_file(get_full_path(turn["value"], manifest_path)).to_cut()
-        return cut.truncate(offset=turn["offset"], duration=turn["duration"]).with_id(self._make_cut_id(cut, turn))
+        return cut.truncate(offset=turn["offset"], duration=turn["duration"]).with_id(
+            self._make_cut_id(cut, turn, manifest_path)
+        )
 
     def _iter_tar(self):
         # See NeMoMultimodalConversationJsonlAdapter._iter_tar for GetBatch-mode rationale.
@@ -949,14 +970,14 @@ class NeMoMultimodalConversationShareGPTJsonlAdapter:
                             offset=turn.get('offset', 0.0),
                             sampling_rate=turn.get('sampling_rate', 16000),
                         )
-                        cut = cut.with_id(self._make_cut_id(cut, turn))
+                        cut = cut.with_id(self._make_cut_id(cut, turn, jsonl_path))
                     else:
                         recording, audio_path = next(tar)
                         audio_path = str(audio_path)
                         cut = recording.to_cut().truncate(
                             offset=turn.get("offset", 0.0), duration=turn.get("duration")
                         )
-                        cut = cut.with_id(self._make_cut_id(cut, turn))
+                        cut = cut.with_id(self._make_cut_id(cut, turn, jsonl_path))
                         assert (
                             audio_path == turn['value']
                         ), f"Mismatch between JSONL and tar. JSONL defines audio path={turn['value']} but we got the following from tar {audio_path=}"
