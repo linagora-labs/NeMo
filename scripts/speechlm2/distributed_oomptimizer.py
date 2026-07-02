@@ -1117,18 +1117,33 @@ def _run_distributed_supervisor(
         )
 
     profile = {}
-    next_start = max(1, start_batch_size)
+    prev_max_ok = None  # previous (larger) bucket's result -> monotonic lower bound for the next bucket
+    prev_seq_len_in = None  # its input sequence length -> size-aware first-probe estimate
     probe_index = 0
     indeterminate_retries: dict[tuple[str, int], int] = {}
     for bucket, (seq_len_in, seq_len_out) in reversed(list(zip(buckets, max_seq_lens))):
         if is_primary_supervisor:
             click.echo(f"The current sequence lengths are: input={seq_len_in} output={seq_len_out}.")
+        # First-probe estimate. Memory per sample ~ input sequence length, so batch_max ~ 1/seq_len:
+        # scale the previous (larger) bucket's batch size by how much shorter THIS bucket's input is,
+        # instead of a flat 1.5x bump. Falls back to 1.5x if sequence lengths are unavailable.
+        if prev_max_ok is None:
+            start_current = max(1, start_batch_size)
+        else:
+            ratio = (prev_seq_len_in / seq_len_in) if (prev_seq_len_in and seq_len_in) else 1.5
+            start_current = max(prev_max_ok + 1, int(math.ceil(prev_max_ok * ratio)))
         search = DistributedSearchState(
-            current=next_start,
+            current=start_current,
             threshold=threshold,
             target_memory=target_memory,
             memory_metric=("peak_reserved" if profile_memory == "reserved" else "peak_allocated"),
         )
+
+        # Monotonic lower bound: a smaller bucket fits at least as many samples as the previous (larger)
+        # one. Seed that result as the floor so an OOM bisects prev_max_ok..oom instead of collapsing to
+        # oom//2. apply_records() (resume) composes correctly since it keeps max(record, seeded floor).
+        if prev_max_ok is not None:
+            search.max_ok = prev_max_ok
 
         prior = None
         try:
@@ -1146,7 +1161,8 @@ def _run_distributed_supervisor(
                     )
                 profile[(bucket, seq_len_in, seq_len_out)] = search.max_ok
                 if search.max_ok is not None:
-                    next_start = max(search.max_ok + 1, int(math.ceil(search.max_ok * 1.5)))
+                    prev_max_ok = search.max_ok
+                    prev_seq_len_in = seq_len_in
                 continue
             search.advance()
             if is_primary_supervisor:
@@ -1257,7 +1273,8 @@ def _run_distributed_supervisor(
                 fg="green",
             )
         profile[(bucket, seq_len_in, seq_len_out)] = search.max_ok
-        next_start = max(search.max_ok + 1, int(math.ceil(search.max_ok * 1.5)))
+        prev_max_ok = search.max_ok
+        prev_seq_len_in = seq_len_in
 
     if is_primary_supervisor:
         _emit_profile(profile, buckets, memory_fraction, ddp, dtype, profile_memory)
