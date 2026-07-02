@@ -55,6 +55,32 @@ from nemo.utils import logging
 from nemo.utils.dtype import str_to_dtype
 
 
+def _format_conversations(conversations) -> str:
+    """Render a batch of ``NeMoMultimodalConversation`` objects into a human-readable string,
+    dumping each conversation's turns (role + text/audio) instead of the bare ``CutSet`` repr."""
+    from nemo.collections.common.data.lhotse.text_adapters import AudioTurn, TextTurn
+
+    if not conversations:
+        return "<empty>"
+    lines = []
+    for conv in conversations:
+        lines.append(f"=== conversation id={getattr(conv, 'id', '?')} ===")
+        for i, turn in enumerate(getattr(conv, "turns", []) or []):
+            if isinstance(turn, TextTurn):
+                lines.append(f"  [{i}] TEXT ({turn.role}): {turn.value!r}")
+            elif isinstance(turn, AudioTurn):
+                cut = turn.cut
+                src = getattr(getattr(cut, "recording", None), "sources", None)
+                src = src[0].source if src else "<in-memory>"
+                lines.append(
+                    f"  [{i}] AUDIO ({turn.role}): duration={getattr(cut, 'duration', '?')}s "
+                    f"id={getattr(cut, 'id', '?')} source={src} text={turn.text!r}"
+                )
+            else:
+                lines.append(f"  [{i}] {turn!r}")
+    return "\n".join(lines)
+
+
 class SALM(LightningModule, HFHubMixin):
     def __init__(self, cfg) -> None:
         assert isinstance(cfg, dict), (
@@ -195,7 +221,17 @@ class SALM(LightningModule, HFHubMixin):
         except Exception as e:
             ids = [getattr(c, "id", "?") for c in (batch.get("conversations") or [])]
             lens = batch["audio_lens"].tolist()
-            logging.error(f"Audio encoding failed ({type(e).__name__}: {e}). Full batch: {batch.get("conversations")}")
+            durations = [round(l / self.sampling_rate, 2) for l in lens]
+            batch_size = batch["input_ids"].shape[0]
+            num_tokens = batch["input_ids"].shape[0] * batch["input_ids"].shape[1]
+            logging.error("")
+            logging.error(
+                f"Audio encoding failed ({type(e).__name__}: {e}). "
+                f"Batch stats: batch_size={batch_size} seq_len={batch['input_ids'].shape[1]} "
+                f"num_tokens={num_tokens} audio_durations_s={durations} total_audio_s={round(sum(durations), 2)}. "
+                f"Full batch:\n{_format_conversations(batch.get('conversations'))}"
+            )
+            logging.error("")
             raise Exception(f"Audio encoding failed {ids=} {lens=}")
         input_ids_to_embed = torch.where(batch["input_ids"] == self.audio_locator_tag_id, 0, batch["input_ids"])
         text_embs = self.embed_tokens(input_ids_to_embed)
