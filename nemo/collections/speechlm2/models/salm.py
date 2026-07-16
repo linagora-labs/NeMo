@@ -44,6 +44,7 @@ from nemo.collections.speechlm2.parts.input_utils import _unpad_inputs
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
 from nemo.collections.speechlm2.parts.pretrained import (
+    _resolve_llm_config_overrides,
     delete_embeddings,
     load_pretrained_hf,
     maybe_load_pretrained_models,
@@ -107,6 +108,7 @@ class SALM(LightningModule, HFHubMixin):
             pretrained_weights=self.cfg.pretrained_weights,
             dtype=torch_dtype,
             trust_remote_code=self.cfg.get("trust_remote_code", False),
+            config_overrides=_resolve_llm_config_overrides(self.cfg),
         )
         # Note: we have to "move out" the token embedding outside of LLM to avoid
         #       messing up FSDP/TP hooks. Use architecture-agnostic helpers so models
