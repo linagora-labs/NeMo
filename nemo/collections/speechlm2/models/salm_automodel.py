@@ -34,6 +34,7 @@ from nemo.collections.speechlm2.parts.encoder_chunking import encode_audio_with_
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
 from nemo.collections.speechlm2.parts.pretrained import (
+    _resolve_llm_config_overrides,
     load_pretrained_automodel_llm,
     maybe_load_pretrained_models,
     setup_speech_encoder,
@@ -84,10 +85,18 @@ class SALMAutomodel(LightningModule, HFHubMixin):
 
     @property
     def embed_tokens(self):
-        """Navigate to the LLM's embedding layer (kept inside the LLM)."""
+        """Navigate to the LLM's embedding layer (kept inside the LLM).
+
+        Use the HF `get_input_embeddings()` API rather than a hardcoded
+        `self.llm.model.embed_tokens` path: the latter is Llama/Qwen-specific
+        and breaks on architectures that name their trunk/embedding differently
+        (e.g. dense Nemotron-H, whose embedding lives at `backbone.embeddings`).
+        This matches the non-automodel SALM (salm.py). Returns the nn.Embedding
+        module, so `.weight` / `.num_embeddings` keep working.
+        """
         if self.llm is None:
             return None
-        return self.llm.model.embed_tokens
+        return self.llm.get_input_embeddings()
 
     def _embed_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Embed token IDs using the LLM's embedding table.
@@ -263,6 +272,52 @@ class SALMAutomodel(LightningModule, HFHubMixin):
         averaging (see ``_configure_moe_aux_loss_scaler``)."""
         self._validate_parallelism_compatibility()
         self._configure_moe_aux_loss_scaler()
+        self._maybe_install_backward_grad_clip()
+
+    def _maybe_install_backward_grad_clip(self) -> None:
+        """Per-layer backward gradient clipping (config ``model.backward_grad_clip``, a float).
+
+        Nemotron-H's squared-ReLU MLP layers amplify the backward gradient ~×30-800 each.
+        Backprop to any input-side trainable param (perception.proj, early-layer LoRA)
+        compounds this over ~50 frozen layers
+        and overflows to inf -> NaN on the first update. Clipping the grad-output norm of
+        each backbone layer to ``backward_grad_clip`` keeps the gradient finite through the
+        whole stack (it can never compound to inf); the global ``gradient_clip_val`` then
+        governs the actual optimizer step. Disabled when unset/<=0."""
+        from nemo.utils import logging
+
+        clip = self.cfg.get("backward_grad_clip", None)
+        if clip is None:
+            return
+        clip = float(clip)
+        if clip <= 0:
+            return
+        import re as _re
+
+        pat = _re.compile(r"backbone\.layers\.\d+$")
+
+        def _make_clamp():
+            def _clamp(grad):
+                if grad is None:
+                    return grad
+                n = grad.detach().float().norm()
+                if torch.isfinite(n) and n > clip:
+                    return grad * (clip / n).to(grad.dtype)
+                return grad
+
+            return _clamp
+
+        def _fwd_hook(module, args, output):
+            out = output[0] if isinstance(output, (tuple, list)) else output
+            if torch.is_tensor(out) and out.requires_grad:
+                out.register_hook(_make_clamp())
+
+        n = 0
+        for name, mod in self.named_modules():
+            if pat.search(name):
+                mod.register_forward_hook(_fwd_hook)
+                n += 1
+        logging.warning(f"backward_grad_clip={clip}: installed per-layer grad-output clipping on {n} backbone layers")
 
     def _validate_parallelism_compatibility(self) -> None:
         """Raise on known-incompatible THD/CP/backend configurations.
@@ -847,6 +902,16 @@ class SALMAutomodel(LightningModule, HFHubMixin):
             pretrained_weights=self.cfg.pretrained_weights,
             dtype=dtype,
             trust_remote_code=self.cfg.get("trust_remote_code", False),
+            # force_hf: use the HF (bundled remote-code) model, not automodel's
+            # native custom impl. Required for dense Nemotron-H (Luciole): automodel
+            # registers a native NemotronHForCausalLM for the *v3 MoE* variant and
+            # its compat gate only checks `n_routed_experts is not None` — but the
+            # dense config carries a stray default n_routed_experts=8, so the gate
+            # wrongly passes and the v3 model (no `.backbone`) is built, crashing the
+            # parallelizer at `model.backbone.layers`. Forcing HF gives the bundled
+            # dense model whose `.backbone` matches the parallelizer / find_embedding_layer.
+            force_hf=self.cfg.get("force_hf", False),
+            config_overrides=_resolve_llm_config_overrides(self.cfg),
             **automodel_kwargs,
         )
 

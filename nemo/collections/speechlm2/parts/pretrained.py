@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Dict
 
 import torch
-from omegaconf import OmegaConf, open_dict
+from omegaconf import DictConfig, OmegaConf, open_dict
 from peft import PeftModel
 from safetensors.torch import load_file
 from transformers import AutoConfig, AutoModelForCausalLM
@@ -41,8 +41,27 @@ def load_pretrained_nemo(cls, model_path_or_name: str):
         return cls.from_pretrained(model_path_or_name)
 
 
+def _resolve_llm_config_overrides(cfg) -> dict:
+    """Read ``model.llm_config_overrides`` (a dict of HF config attributes to override
+    at load time) from the model config and return it as a plain, fully-resolved dict.
+
+    Returns ``{}`` when the key is absent. Used by SALM / SALMAutomodel to forward
+    e.g. ``{residual_in_fp32: True}`` into ``from_pretrained`` for Nemotron-H Mamba2
+    training stability (see recipe/luciole-8b.yaml)."""
+    overrides = cfg.get("llm_config_overrides", None)
+    if overrides is None:
+        return {}
+    if isinstance(overrides, DictConfig):
+        return OmegaConf.to_container(overrides, resolve=True)
+    return dict(overrides)
+
+
 def load_pretrained_hf(
-    model_path_or_name: str, pretrained_weights: bool = True, dtype=torch.float32, trust_remote_code: bool = False
+    model_path_or_name: str,
+    pretrained_weights: bool = True,
+    dtype=torch.float32,
+    trust_remote_code: bool = False,
+    config_overrides: dict = None,
 ):
     """
     Load pretrained HuggingFace AutoModelForCausalLM.
@@ -55,13 +74,22 @@ def load_pretrained_hf(
         pretrained_weights: Whether to load pretrained weights (True) or random init (False)
         dtype: Data type for the model
         trust_remote_code: Whether to trust remote code when loading model (needed for some models like Nemotron)
+        config_overrides: Optional dict of config attributes forwarded to ``from_pretrained`` /
+            ``AutoConfig`` to override the checkpoint's ``config.json`` at load time (e.g.
+            ``{"residual_in_fp32": True}`` to keep Nemotron-H's residual stream in fp32; see
+            recipe/luciole-8b.yaml).
     """
+    config_overrides = dict(config_overrides or {})
     if pretrained_weights:
+        if config_overrides:
+            logging.info(f"load_pretrained_hf: applying config_overrides={config_overrides}")
         return AutoModelForCausalLM.from_pretrained(
-            model_path_or_name, torch_dtype=dtype, trust_remote_code=trust_remote_code
+            model_path_or_name, torch_dtype=dtype, trust_remote_code=trust_remote_code, **config_overrides
         )
     else:
-        config = AutoConfig.from_pretrained(model_path_or_name, trust_remote_code=trust_remote_code)
+        config = AutoConfig.from_pretrained(
+            model_path_or_name, trust_remote_code=trust_remote_code, **config_overrides
+        )
         return AutoModelForCausalLM.from_config(config, torch_dtype=dtype, trust_remote_code=trust_remote_code)
 
 
@@ -70,6 +98,7 @@ def load_pretrained_automodel_llm(
     pretrained_weights: bool = True,
     dtype=torch.float32,
     trust_remote_code: bool = False,
+    config_overrides: dict = None,
     **kwargs,
 ):
     """
@@ -87,10 +116,30 @@ def load_pretrained_automodel_llm(
     """
     from nemo_automodel import NeMoAutoModelForCausalLM
 
+    # config_overrides (e.g. residual_in_fp32=True for Nemotron-H Mamba2 training
+    # stability) are HF config attributes; from_pretrained applies them onto the
+    # loaded config. See recipe/luciole-8b.yaml.
+    config_overrides = dict(config_overrides or {})
     if pretrained_weights:
-        return NeMoAutoModelForCausalLM.from_pretrained(model_path_or_name, torch_dtype=dtype, **kwargs)
+        # Forward trust_remote_code so the bundled (remote-code) model is built.
+        # Dense Nemotron-H (Luciole) needs this: with force_hf the loader builds an
+        # HF model, and only the bundled modeling exposes `.backbone` (what the
+        # nemo_automodel parallelizer expects). transformers' built-in nemotron_h
+        # renamed the trunk to `.model`, so without trust_remote_code the load falls
+        # back to the built-in and the parallelizer crashes on `model.backbone`.
+        if config_overrides:
+            logging.info(f"load_pretrained_automodel_llm: applying config_overrides={config_overrides}")
+        return NeMoAutoModelForCausalLM.from_pretrained(
+            model_path_or_name,
+            torch_dtype=dtype,
+            trust_remote_code=trust_remote_code,
+            **config_overrides,
+            **kwargs,
+        )
     else:
-        config = AutoConfig.from_pretrained(model_path_or_name, trust_remote_code=trust_remote_code)
+        config = AutoConfig.from_pretrained(
+            model_path_or_name, trust_remote_code=trust_remote_code, **config_overrides
+        )
         return NeMoAutoModelForCausalLM.from_config(config, torch_dtype=dtype, **kwargs)
 
 
