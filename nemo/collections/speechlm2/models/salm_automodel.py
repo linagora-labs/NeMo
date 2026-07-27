@@ -401,52 +401,6 @@ class SALMAutomodel(LightningModule, HFHubMixin):
         averaging (see ``_configure_moe_aux_loss_scaler``)."""
         self._validate_parallelism_compatibility()
         self._configure_moe_aux_loss_scaler()
-        self._maybe_install_backward_grad_clip()
-
-    def _maybe_install_backward_grad_clip(self) -> None:
-        """Per-layer backward gradient clipping (config ``model.backward_grad_clip``, a float).
-
-        Nemotron-H's squared-ReLU MLP layers amplify the backward gradient ~×30-800 each.
-        Backprop to any input-side trainable param (perception.proj, early-layer LoRA)
-        compounds this over ~50 frozen layers
-        and overflows to inf -> NaN on the first update. Clipping the grad-output norm of
-        each backbone layer to ``backward_grad_clip`` keeps the gradient finite through the
-        whole stack (it can never compound to inf); the global ``gradient_clip_val`` then
-        governs the actual optimizer step. Disabled when unset/<=0."""
-        from nemo.utils import logging
-
-        clip = self.cfg.get("backward_grad_clip", None)
-        if clip is None:
-            return
-        clip = float(clip)
-        if clip <= 0:
-            return
-        import re as _re
-
-        pat = _re.compile(r"backbone\.layers\.\d+$")
-
-        def _make_clamp():
-            def _clamp(grad):
-                if grad is None:
-                    return grad
-                n = grad.detach().float().norm()
-                if torch.isfinite(n) and n > clip:
-                    return grad * (clip / n).to(grad.dtype)
-                return grad
-
-            return _clamp
-
-        def _fwd_hook(module, args, output):
-            out = output[0] if isinstance(output, (tuple, list)) else output
-            if torch.is_tensor(out) and out.requires_grad:
-                out.register_hook(_make_clamp())
-
-        n = 0
-        for name, mod in self.named_modules():
-            if pat.search(name):
-                mod.register_forward_hook(_fwd_hook)
-                n += 1
-        logging.warning(f"backward_grad_clip={clip}: installed per-layer grad-output clipping on {n} backbone layers")
 
     def on_validation_start(self) -> None:
         """Reject unsupported parallel layouts for fit and standalone validation."""

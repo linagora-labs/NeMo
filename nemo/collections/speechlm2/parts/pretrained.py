@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict
@@ -217,12 +218,13 @@ def load_pretrained_automodel_llm(
         return model
 
     if pretrained_weights:
-        # Forward trust_remote_code so the bundled (remote-code) model is built.
-        # Dense Nemotron-H (Luciole) needs this: with force_hf the loader builds an
-        # HF model, and only the bundled modeling exposes `.backbone` (what the
-        # nemo_automodel parallelizer expects). transformers' built-in nemotron_h
-        # renamed the trunk to `.model`, so without trust_remote_code the load falls
-        # back to the built-in and the parallelizer crashes on `model.backbone`.
+        # trust_remote_code selects between transformers' BUILT-IN modeling (False) and the
+        # checkpoint's bundled remote code (True). For dense Nemotron-H (Luciole) we now run
+        # trust_remote_code=False on transformers>=5.6 (built-in parses the dense '-'=MLP
+        # pattern; see conf/base_automodel.yaml). The built-in trunk is `.model`, the bundled
+        # one `.backbone`; nemo_automodel's parallelizer and find_embedding_layer are patched
+        # to accept both, so either value loads. force_hf (a separate kwarg) is what keeps the
+        # loader on the HF model rather than automodel's native v3 impl.
         if config_overrides:
             logging.info(f"load_pretrained_automodel_llm: applying config_overrides={config_overrides}")
         return NeMoAutoModelForCausalLM.from_pretrained(
@@ -299,7 +301,8 @@ def find_embedding_layer(llm):
     """
     # (parent_path..., attr) candidates for common architectures.
     paths_to_try = [
-        ['backbone', 'embeddings'],  # NemotronH
+        ['backbone', 'embeddings'],  # NemotronH (bundled remote-code trunk)
+        ['model', 'embeddings'],  # NemotronH (transformers built-in trunk)
         ['model', 'embed_tokens'],  # Llama, Mistral, Qwen, standard Nemotron
         ['transformer', 'wte'],  # GPT-2
         ['gpt_neox', 'embed_in'],  # GPT-NeoX
@@ -308,6 +311,12 @@ def find_embedding_layer(llm):
     # Unwrap PeftModel (LoRA) to reach the underlying base model.
     if isinstance(llm, PeftModel):
         llm = llm.base_model.model
+    # Two candidates share the ``model`` parent — NemotronH built-in (`model.embeddings`)
+    # and Llama-family (`model.embed_tokens`). Disambiguate by preferring the candidate
+    # whose embedding attribute is actually PRESENT. Only fall back to the first candidate
+    # whose parent path resolves when no attribute is present, which happens when the
+    # embedding was deleted (delete_embeddings) and we are locating it to restore it.
+    fallback = None
     for *parents, attr in paths_to_try:
         obj = llm
         for name in parents:
@@ -315,8 +324,11 @@ def find_embedding_layer(llm):
             if obj is None:
                 break
         else:
-            return obj, attr
-    return None, None
+            if hasattr(obj, attr):
+                return obj, attr
+            if fallback is None:
+                fallback = (obj, attr)
+    return fallback if fallback is not None else (None, None)
 
 
 def delete_embeddings(llm) -> bool:
@@ -724,6 +736,28 @@ def init_model_from_checkpoint(model: torch.nn.Module, checkpoint_path: str):
 
     logging.info(f"Loading model from checkpoint: {checkpoint_path}")
     checkpoint_state = _load_checkpoint_state(checkpoint_path)
+
+    # `set_model_dict_for_partial_init` silently drops every checkpoint key that
+    # the target model doesn't have (or whose shape differs), and the strict
+    # load below then trivially passes because the dict it receives was built
+    # from the model's own state_dict. A warm start with a mismatched config
+    # (different LoRA rank, LoRA vs no-LoRA, different encoder attention) can
+    # therefore load almost nothing and still look successful. Report it.
+    ckpt_keys = set(checkpoint_state)
+    model_keys = set(model.state_dict())
+    dropped = sorted(ckpt_keys - model_keys)
+    loaded = ckpt_keys & model_keys
+    logging.info(
+        f"Checkpoint init: {len(loaded)}/{len(ckpt_keys)} checkpoint tensors matched the model "
+        f"({len(model_keys - ckpt_keys)} model tensors left at their pre-checkpoint values)."
+    )
+    if dropped:
+        by_prefix = Counter(k.split(".")[0] for k in dropped)
+        logging.warning(
+            f"Checkpoint init: {len(dropped)} checkpoint tensors were DROPPED (absent from the model): "
+            f"{dict(by_prefix)}. First few: {dropped[:5]}. "
+            "If this is unexpected, the run config does not match the checkpoint's architecture."
+        )
 
     checkpoint_state = set_model_dict_for_partial_init(checkpoint_state, model.state_dict())
     model.load_state_dict(checkpoint_state, strict=True)
