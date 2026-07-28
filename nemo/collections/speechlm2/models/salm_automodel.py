@@ -41,6 +41,7 @@ from nemo.collections.speechlm2.parts.pretrained import (
     update_perception_output_dim,
 )
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, MaskType, NeuralType
+from nemo.utils import logging
 
 
 class SALMAutomodel(LightningModule, HFHubMixin):
@@ -272,6 +273,54 @@ class SALMAutomodel(LightningModule, HFHubMixin):
         averaging (see ``_configure_moe_aux_loss_scaler``)."""
         self._validate_parallelism_compatibility()
         self._configure_moe_aux_loss_scaler()
+        self._apply_train_eval_modes()
+        self._report_activation_checkpointing()
+
+    def _llm_decoder_layers(self) -> list:
+        """The LLM's decoder layer list, under either trunk name (`model` or `backbone`)."""
+        for attr in ("model", "backbone"):
+            trunk = getattr(self.llm, attr, None)
+            layers = getattr(trunk, "layers", None) if trunk is not None else None
+            if layers is not None:
+                return list(layers)
+        return []
+
+    def _report_activation_checkpointing(self) -> None:
+        """Log whether the requested LLM activation checkpointing is actually in effect.
+
+        ``activation_checkpointing_llm: true`` can be honored all the way down to
+        ``gradient_checkpointing_enable()`` and still be a no-op at forward time (see
+        :meth:`_apply_train_eval_modes`). The failure costs tens of GB and reports nothing:
+        no warning, no missing key, just an OOM some buckets later. So state the outcome
+        explicitly at fit start rather than leaving it to be inferred from a crash.
+        """
+        strategy = getattr(self, "_trainer", None) and self._trainer.strategy
+        if not getattr(strategy, "activation_checkpointing_llm", False):
+            return
+        layers = self._llm_decoder_layers()
+        if not layers:
+            warnings.warn(
+                "activation_checkpointing_llm=true but no LLM decoder layers were found "
+                f"under {type(self.llm).__name__}.model/.backbone -- cannot verify it is active."
+            )
+            return
+        layer = layers[0]
+        wrapped = any("checkpoint" in type(m).__name__.lower() for m in layer.modules())
+        hf_native = bool(getattr(layer, "gradient_checkpointing", False))
+        if wrapped or (hf_native and layer.training):
+            logging.info(
+                "LLM activation checkpointing ACTIVE (torch wrapper=%s, hf_native=%s, training=%s)",
+                wrapped,
+                hf_native,
+                layer.training,
+            )
+        else:
+            warnings.warn(
+                "activation_checkpointing_llm=true but activation checkpointing is INERT on "
+                f"{type(layer).__name__}: no checkpoint wrapper, hf_native={hf_native}, "
+                f"training={layer.training}. Activations will be retained for every layer and "
+                "long sequences will OOM. See SALMAutomodel._apply_train_eval_modes."
+            )
 
     def _validate_parallelism_compatibility(self) -> None:
         """Raise on known-incompatible THD/CP/backend configurations.
@@ -302,11 +351,34 @@ class SALMAutomodel(LightningModule, HFHubMixin):
             device_capability=device_capability,
         )
 
+    def _apply_train_eval_modes(self) -> None:
+        """Put frozen submodules in eval and every trainable one back in train mode.
+
+        The train/eval flag is NOT cosmetic on the LLM. transformers' HF-native activation
+        checkpointing is guarded by ``if self.gradient_checkpointing and self.training``
+        (``modeling_layers.py::GradientCheckpointingLayer.__call__``), so a LLM left in eval
+        SILENTLY skips checkpointing even with ``activation_checkpointing_llm: true`` -- the
+        flag is set, ``gradient_checkpointing_enable()`` is called, and every layer still
+        falls through to the plain forward. ``from_pretrained`` returns the model in eval and
+        nothing restored it, so the LLM stayed there for the whole run.
+
+        That is what OOM'd Luciole-23B: ~2 GB of retained activations per layer instead of
+        the ~100 MB a checkpointed layer stores, i.e. ~60 GB of activations on a forward that
+        should have used 4. The 8B never hit it -- ``NemotronHForCausalLM`` has a registered
+        parallelization strategy that wraps layers with torch's ``checkpoint_wrapper``, which
+        ignores train/eval; only models falling back to the default strategy (dense
+        ``nemotron``, i.e. the 23B) get the mode-dependent HF-native path.
+
+        Setting train mode here is also simply correct: a LoRA'd LLM has trainable params, so
+        it belongs in train mode. Dropout is 0.0 in these recipes and Nemotron uses LayerNorm
+        (mode-independent), so nothing else changes.
+        """
+        for m in (self.perception.preprocessor, self.perception.encoder, self.llm):
+            m.eval() if is_frozen(m) else m.train()
+
     def training_step(self, batch: dict, batch_idx: int):
         self._current_batch_idx = batch_idx
-        for m in (self.perception.preprocessor, self.perception.encoder, self.llm):
-            if is_frozen(m):
-                m.eval()
+        self._apply_train_eval_modes()
 
         inputs = self.prepare_inputs(batch)
         forward_outputs = self(

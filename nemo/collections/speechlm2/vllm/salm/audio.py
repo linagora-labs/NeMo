@@ -56,7 +56,14 @@ from vllm.multimodal.processing import (
     PromptUpdate,
     PromptUpdateDetails,
 )
-from vllm.multimodal.processing.dummy_inputs import BaseDummyInputsBuilder
+
+try:
+    from vllm.multimodal.processing.dummy_inputs import BaseDummyInputsBuilder
+except ModuleNotFoundError:
+    # vLLM <= 0.14 (the version shipped in the NeMo 26.02 container): the dummy
+    # inputs builder still lives in ``vllm.multimodal.profiling``.
+    from vllm.multimodal.profiling import BaseDummyInputsBuilder
+
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from nemo.collections.speechlm2.vllm.salm.config import _AUDIO_PLACEHOLDER
@@ -127,10 +134,16 @@ class NeMoSpeechLMAudioInputs(TensorSchema):
 class NeMoSpeechLMProcessingInfo(BaseProcessingInfo):
 
     def get_data_parser(self) -> MultiModalDataParser:
+        kwargs = {}
+        # ``_get_expected_hidden_size`` (embedding-input validation) only exists
+        # from vLLM 0.15 on; the 0.14 in the NeMo 26.02 container has no such check.
+        expected_hidden_size = getattr(self, "_get_expected_hidden_size", None)
+        if expected_hidden_size is not None:
+            kwargs["expected_hidden_size"] = expected_hidden_size()
         return MultiModalDataParser(
             target_sr=_SAMPLING_RATE,
             target_channels=_AUDIO_CHANNELS,
-            expected_hidden_size=self._get_expected_hidden_size(),
+            **kwargs,
         )
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
@@ -242,6 +255,15 @@ class NeMoSpeechLMMultiModalProcessor(
     BaseMultiModalProcessor[NeMoSpeechLMProcessingInfo],
 ):
 
+    def _get_data_parser(self) -> MultiModalDataParser:
+        """Use the plugin's parser (16 kHz mono) on vLLM <= 0.14.
+
+        Newer vLLM asks the ``ProcessingInfo`` for the parser; 0.14 builds a
+        default one on the processor itself, which has no ``target_sr`` and so
+        refuses any audio submitted with its sampling rate.
+        """
+        return self.info.get_data_parser()
+
     def _get_mm_fields_config(
         self,
         hf_inputs: BatchFeature,
@@ -267,6 +289,11 @@ class NeMoSpeechLMMultiModalProcessor(
         hf_processor_mm_kwargs: Mapping[str, object],
         out_mm_kwargs: MultiModalKwargsItems,
     ) -> list[PromptUpdate]:
+        if "audio" not in mm_items:
+            # vLLM <= 0.14 calls this a second time with only the items missing
+            # from the processor cache -- an empty set once everything is
+            # cached, where ``get_items`` raises instead of returning nothing.
+            return []
         audios = mm_items.get_items("audio", AudioProcessorItems)
         chunk_size_seconds = self.info._get_encoder_chunk_size_seconds()
 

@@ -22,7 +22,11 @@ vs standard transformer backends are auto-detected from the backbone's
 own ``architectures`` field.
 """
 
+from pathlib import Path
+
 from transformers import AutoConfig, PretrainedConfig
+
+from nemo.collections.speechlm2.parts.hf_hub import LLM_BACKBONE_DIR
 
 _HYBRID_ARCHITECTURES = frozenset(
     {
@@ -142,7 +146,7 @@ class NeMoSpeechLMConfig(PretrainedConfig):
         self.lora = lora
         self.encoder_chunk_size_seconds = encoder_chunk_size_seconds
 
-        self.text_config = AutoConfig.from_pretrained(pretrained_llm, trust_remote_code=True)
+        self.text_config = self._load_backbone_config(self._resolve_llm_source(pretrained_llm))
 
         raw_archs = getattr(self.text_config, "architectures", [])
         if len(raw_archs) != 1:
@@ -177,6 +181,66 @@ class NeMoSpeechLMConfig(PretrainedConfig):
                 self.text_config.layer_types = ["attention"] * num_layers
 
         self.text_config.vocab_size += _SPEECHLM_EMBED_EXTRA_ROWS
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        """Carry the checkpoint location into ``__init__`` so ``llm_backbone/`` is findable.
+
+        ``AutoConfig.from_pretrained`` injects ``name_or_path`` for us, but vLLM
+        bypasses it (``transformers_utils/config.py`` calls the registered config
+        class directly) and then ``_name_or_path`` is empty exactly when
+        ``_resolve_llm_source`` needs it.
+        """
+        kwargs.setdefault("name_or_path", str(pretrained_model_name_or_path))
+        return super().from_pretrained(pretrained_model_name_or_path, **kwargs)
+
+    @staticmethod
+    def _load_backbone_config(source: str) -> PretrainedConfig:
+        """Load the backbone config, preferring vLLM's own class for that ``model_type``.
+
+        vLLM ships private config classes for a few architectures and its inner
+        model classes assert on them (``nemotron.py``: ``assert isinstance(config,
+        NemotronConfig)``, with ``NemotronConfig`` imported from
+        ``vllm.transformers_utils.configs``). Transformers' identically-named
+        class is a different object, so a plain ``AutoConfig`` load trips that
+        assertion. Going through vLLM's registry -- exactly what vLLM does for
+        top-level models -- keeps both paths in agreement.
+        """
+        config = AutoConfig.from_pretrained(source, trust_remote_code=True)
+        try:
+            from vllm.transformers_utils.config import _CONFIG_REGISTRY
+        except ImportError:
+            return config
+        model_type = getattr(config, "model_type", None)
+        # Indexing, not ``.get()``: the registry is a lazy dict whose ``__getitem__``
+        # imports the module and returns the class, while ``.get()`` falls back to
+        # ``dict.get`` and hands back the unresolved import path.
+        vllm_class = _CONFIG_REGISTRY[model_type] if model_type in _CONFIG_REGISTRY else None
+        if vllm_class is not None and not isinstance(config, vllm_class):
+            config = vllm_class.from_pretrained(source, trust_remote_code=True)
+        return config
+
+    def _resolve_llm_source(self, pretrained_llm: str) -> str:
+        """Prefer the backbone config saved beside the checkpoint over the Hub id.
+
+        ``to_hf.py`` writes the backbone's own config to ``llm_backbone/`` at
+        export time, but leaves ``pretrained_llm`` as the training-time Hub id
+        (e.g. ``OpenLLM-France/Luciole-1B-SFT-1.1``). Resolving that id here
+        would need network access and Hub credentials at every server start,
+        and fails outright for private repos -- while the exact same config is
+        already sitting in the checkpoint directory.
+
+        Mirrors ``hf_hub._inject_local_artifact_paths``, which does the same
+        redirect on the NeMo ``SALM.from_pretrained`` path. ``_name_or_path``
+        is the checkpoint directory, passed down by ``PretrainedConfig`` from
+        ``AutoConfig.from_pretrained``.
+        """
+        root = getattr(self, "_name_or_path", "")
+        if root:
+            local = Path(root) / LLM_BACKBONE_DIR
+            if (local / "config.json").is_file():
+                return str(local)
+        return pretrained_llm
 
     @property
     def llm_architectures(self) -> list[str]:
