@@ -112,7 +112,11 @@ def _merge_lora_weights(
 
     if not lora_cfg:
         lora_cfg = {"r": 128, "lora_alpha": 256}
-    scaling = lora_cfg.get("lora_alpha", 1) / lora_cfg.get("r", 1)
+    # Two spellings in the wild: HF PEFT writes ``lora_alpha``/``r`` (SALM),
+    # nemo_automodel writes ``alpha``/``dim`` (SALMAutomodel).
+    alpha = lora_cfg.get("lora_alpha", lora_cfg.get("alpha", 1))
+    rank = lora_cfg.get("r", lora_cfg.get("dim", 1))
+    scaling = alpha / rank
 
     base: dict[str, torch.Tensor] = {}
     lora_a: dict[str, torch.Tensor] = {}
@@ -242,6 +246,20 @@ class HybridBackend(_BaseBackend):
     sees a stable interface regardless of which backbone is loaded.
     """
 
+    def preprocess_llm_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """Merge LoRA here too: hybrid checkpoints carry adapters as well.
+
+        Luciole-8B is trained with LoRA on ``mixer.{up,down}_proj`` and the
+        attention projections, and ``to_hf.py`` exports the A/B pairs unmerged.
+        vLLM's NemotronH knows nothing about them, so without this pass they are
+        silently dropped and the server answers with the *base* backbone --
+        no error, just the wrong model.
+        """
+        lora_cfg = getattr(self.config, "lora", None)
+        return list(_merge_lora_weights(list(weights), lora_cfg))
+
     def architectures(self) -> list[str]:
         # Normalize to vLLM's official NemotronH architecture name regardless of
         # what the backbone config originally declared (NemotronHybridForCausalLM
@@ -284,6 +302,12 @@ class HybridBackend(_BaseBackend):
                     )
             elif hf_name in (
                 "backbone.embed_tokens.weight",
+                # NemotronH's own name for the embedding, kept as-is by
+                # nemo_automodel; vLLM's WeightsMapper renames it to
+                # ``embed_tokens`` after this pass, so the padding has to
+                # recognize both spellings or the SpeechLM's extra rows are
+                # missing and the embedding fails to load.
+                "backbone.embeddings.weight",
                 "lm_head.weight",
             ):
                 if target_vocab:

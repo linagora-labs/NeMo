@@ -32,6 +32,7 @@ Requires NeMo toolkit for the audio encoder:
 """
 
 from collections.abc import Iterable
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -96,7 +97,7 @@ class NeMoSpeechLMForConditionalGeneration(
         backend = make_backend(config)
         self._backend = backend
 
-        with self._mark_language_model(vllm_config):
+        with self._mark(vllm_config, "_mark_language_model"):
             self.language_model = init_vllm_registered_model(
                 vllm_config=vllm_config,
                 hf_config=config.text_config,
@@ -104,13 +105,26 @@ class NeMoSpeechLMForConditionalGeneration(
                 architectures=backend.architectures(),
             )
 
-        with self._mark_tower_model(vllm_config, {"audio"}):
+        with self._mark(vllm_config, "_mark_tower_model", {"audio"}):
             self.perception = _load_nemo_perception(config.perception)
             _maybe_mount_pe_encoder(self.perception, getattr(config, "pe_encoder_path", None))
 
         self._uses_pe_encoder = isinstance(getattr(self.perception, "encoder", None), ParallelExpertEncoder)
 
         self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
+
+    def _mark(self, vllm_config: VllmConfig, hook: str, *extra):
+        """Enter one of ``SupportsMultiModal``'s submodule-marking contexts, if it exists.
+
+        ``_mark_language_model`` / ``_mark_tower_model`` let newer vLLM place the
+        language tower and the encoder on the right devices. vLLM <= 0.14 (the
+        version in the NeMo 26.02 container) has neither; there the placement is
+        implicit and the plain context does the job.
+        """
+        marker = getattr(self, hook, None)
+        if marker is None:
+            return nullcontext()
+        return marker(vllm_config, *extra)
 
     # ── audio processing ──
 
@@ -196,6 +210,10 @@ class NeMoSpeechLMForConditionalGeneration(
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
+
+    def get_language_model(self) -> nn.Module:
+        """The text tower. vLLM routes token embedding through it (``embed_input_ids``)."""
+        return self.language_model
 
     def get_mm_mapping(self) -> MultiModelKeys:
         return MultiModelKeys.from_string_field(
