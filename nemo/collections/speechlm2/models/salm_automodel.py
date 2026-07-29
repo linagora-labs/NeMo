@@ -79,6 +79,15 @@ class SALMAutomodel(LightningModule, HFHubMixin):
         self._use_fsdp = False
         self._use_tp = False
 
+        # Fused CE + per-bucket memory profiling state (see _setup_fused_cross_entropy
+        # and _profile_step_memory). Set here so inference paths that never call
+        # on_fit_start still find them defined.
+        self._fused_ce = None
+        self._bucket_memory: dict[int, tuple[float, float, int, int, int]] = {}
+        self._prev_step_shape: tuple[int, int] | None = None
+        self._peak_alloc_gib = 0.0
+        self._memory_snapshot_active = False
+
         if self.cfg.get("init_configure_model", False):
             self.configure_model()
 
@@ -403,15 +412,27 @@ class SALMAutomodel(LightningModule, HFHubMixin):
         self._configure_moe_aux_loss_scaler()
         self._apply_train_eval_modes()
         self._report_activation_checkpointing()
+        self._setup_fused_cross_entropy()
+
+    def _llm_trunk(self):
+        """The LLM's transformer trunk -- the module holding ``.layers``.
+
+        Its name differs between implementations (transformers' built-in nemotron_h calls
+        it ``model``, the bundled remote code calls it ``backbone``), and a PEFT wrapper
+        may add a level of attribute forwarding on top. Probing for ``.layers`` identifies
+        the trunk regardless of which of those is in play. Returns ``None`` if no candidate
+        matches, so callers can fall back instead of crashing.
+        """
+        for attr in ("model", "backbone"):
+            trunk = getattr(self.llm, attr, None)
+            if trunk is not None and getattr(trunk, "layers", None) is not None:
+                return trunk
+        return None
 
     def _llm_decoder_layers(self) -> list:
         """The LLM's decoder layer list, under either trunk name (`model` or `backbone`)."""
-        for attr in ("model", "backbone"):
-            trunk = getattr(self.llm, attr, None)
-            layers = getattr(trunk, "layers", None) if trunk is not None else None
-            if layers is not None:
-                return list(layers)
-        return []
+        trunk = self._llm_trunk()
+        return list(trunk.layers) if trunk is not None else []
 
     def _report_activation_checkpointing(self) -> None:
         """Log whether the requested LLM activation checkpointing is actually in effect.
@@ -457,6 +478,225 @@ class SALMAutomodel(LightningModule, HFHubMixin):
     def on_test_start(self) -> None:
         """Reject unsupported parallel layouts for standalone testing."""
         self._validate_parallelism_compatibility(check_backward=False)
+
+    def _setup_fused_cross_entropy(self) -> None:
+        """Wire up the fused linear cross-entropy, or explain why it stayed off.
+
+        The plain path materializes three tensors of shape ``(B*T, vocab)``: the logits,
+        the ``log_softmax`` saved for backward, and the incoming gradient. On Luciole-23B
+        (vocab 128k) at ~9k tokens that is 3 x 2.3 GiB in bf16 -- the single largest
+        identified block of the step. ``linear_cross_entropy`` fuses the ``lm_head`` matmul
+        into the loss and streams it in tiles, so none of the three is ever allocated.
+
+        Opt-in via ``model.fused_linear_cross_entropy: true``. Every prerequisite is checked
+        here rather than at the first training step, so a misconfiguration surfaces at fit
+        start with a reason instead of a traceback 20 minutes in -- and always degrades to
+        the plain path rather than failing the run.
+        """
+        self._fused_ce = None
+        if not self.cfg.get("fused_linear_cross_entropy", False):
+            return
+
+        def _off(reason: str) -> None:
+            warnings.warn(f"fused_linear_cross_entropy=true but staying on the plain logits path: {reason}")
+
+        from nemo_automodel.components.loss.linear_ce import HAVE_CUT_CROSS_ENTROPY, FusedLinearCrossEntropy
+
+        if self.lss_loss is not None:
+            _off("latent speaker supervision (lss_loss) needs the full logits, which the fused path never materializes.")
+            return
+        if not HAVE_CUT_CROSS_ENTROPY:
+            _off("the `cut_cross_entropy` package is not installed in this environment.")
+            return
+        # loss_parallel() shards the vocab dim across TP ranks; the fused kernel takes an
+        # unsharded lm_head and would silently compute a different loss.
+        if self._use_tp:
+            _off("tensor parallelism is enabled, which needs the loss_parallel() vocab sharding.")
+            return
+        if self._llm_trunk() is None:
+            _off(f"no transformer trunk with `.layers` found under {type(self.llm).__name__}.model/.backbone.")
+            return
+        if self._lm_head_weight() is None:
+            _off("lm_head.weight could not be located on the LLM.")
+            return
+        # Without logits_to_keep the wrapper projects every position through lm_head, which
+        # is the (B*T, vocab) allocation this whole path exists to avoid -- so the fused
+        # loss would cost memory instead of saving it.
+        import inspect
+
+        try:
+            params = inspect.signature(type(self.llm).forward).parameters
+        except (TypeError, ValueError):
+            params = {}
+        if "logits_to_keep" not in params and not any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+        ):
+            _off(f"{type(self.llm).__name__}.forward does not accept `logits_to_keep`.")
+            return
+
+        self._fused_ce = FusedLinearCrossEntropy(ignore_index=-100, reduction="sum")
+        logging.info("Fused linear cross-entropy ACTIVE (logits are never materialized).")
+
+    def _lm_head_weight(self):
+        """The output-projection weight, or ``None`` if it cannot be located."""
+        get_out = getattr(self.llm, "get_output_embeddings", None)
+        if callable(get_out):
+            out = get_out()
+            weight = getattr(out, "weight", None)
+            if weight is not None:
+                return weight
+        for name, param in self.llm.named_parameters(remove_duplicate=False):
+            if "lm_head" in name and name.endswith(".weight"):
+                return param
+        return None
+
+    def _forward_hidden_states(self, input_embeds: Tensor, attention_mask: Tensor = None, **llm_kwargs) -> Tensor:
+        """Final hidden states, without ever materializing full-vocabulary logits.
+
+        The causal-LM wrapper has to stay the entry point. ``fully_shard`` registered the
+        root FSDP unit on ``self.llm``, and only that unit's pre-forward hook converts the
+        trunk's final ``norm`` weight (and ``lm_head``) from DTensor shards into plain
+        tensors. Calling the trunk directly skips that hook and dies inside ``norm`` with
+        "got mixed torch.Tensor and DTensor" -- the decoder layers survive it because each
+        one is its own FSDP unit, but the root-level parameters are not.
+
+        So call the wrapper and neutralize the expensive half instead: ``logits_to_keep=1``
+        narrows ``lm_head`` to a single position (``slice(-1, None)``), and a forward hook
+        on the trunk captures the hidden states the fused loss actually consumes.
+        """
+        captured = {}
+
+        def _capture(_module, _args, output):
+            captured["hidden"] = output["last_hidden_state"] if isinstance(output, dict) else output.last_hidden_state
+
+        handle = self._llm_trunk().register_forward_hook(_capture)
+        try:
+            self.llm(
+                inputs_embeds=input_embeds,
+                attention_mask=attention_mask,
+                use_cache=False,
+                return_dict=True,
+                logits_to_keep=1,
+                **llm_kwargs,
+            )
+        finally:
+            handle.remove()
+        if "hidden" not in captured:
+            raise RuntimeError("fused cross-entropy: the LLM trunk forward hook did not fire.")
+        return captured.pop("hidden")
+
+    def _fused_loss_sum(self, hidden: Tensor, target_ids: Tensor) -> Tensor:
+        """Summed CE over the batch, computed without materializing logits."""
+        lm_weight = self._lm_head_weight()
+        # FSDP2 leaves lm_head as a DTensor shard; the kernel needs the full (V, H) matrix.
+        # The plain path pays this same all-gather inside lm_head's forward, so it is not
+        # extra memory -- it just becomes explicit here.
+        if hasattr(lm_weight, "full_tensor"):
+            lm_weight = lm_weight.full_tensor()
+        return self._fused_ce(
+            hidden.reshape(-1, hidden.size(-1)),
+            target_ids.reshape(-1),
+            lm_weight,
+        )
+
+    def _profile_step_memory(self, batch_size: int, seq_len: int) -> None:
+        """Attribute the previous step's peak CUDA memory to the bucket shape that caused it.
+
+        All 27 buckets carry a comparable token budget but not a comparable memory cost:
+        ``(B=103, T=87)`` and ``(B=1, T=8416)`` hold ~9k tokens each yet load the audio
+        encoder and the attention path completely differently. The run's ceiling is set by
+        whichever single bucket peaks highest, so knowing *which* one lets us trim just that
+        entry of ``bucket_batch_size`` instead of lowering the global token plateau.
+
+        Peak stats are read at the start of a step because they then cover the whole of the
+        previous step (forward, backward and optimizer), and are attributed to the shape
+        recorded for that step rather than the current one.
+        """
+        if not torch.cuda.is_available():
+            return
+        prev = self._prev_step_shape
+        if prev is not None:
+            batch, seq = prev
+            alloc = torch.cuda.max_memory_allocated() / 2**30
+            reserved = torch.cuda.max_memory_reserved() / 2**30
+            # Keyed by batch size, NOT by (batch, seqlen): ``bucket_batch_size`` assigns a
+            # distinct batch size to each bucket, while the padded seqlen wanders inside a
+            # bucket from one step to the next. Keying on the pair would grow one row per
+            # step and make the table useless; keying on the batch size keeps it at one row
+            # per bucket, and the seqlen of the worst step is carried along so the offending
+            # batch stays identifiable.
+            best = self._bucket_memory.get(batch)
+            steps = best[4] + 1 if best is not None else 1
+            if best is None or alloc > best[0]:
+                self._bucket_memory[batch] = (alloc, reserved, seq, batch * seq, steps)
+            else:
+                self._bucket_memory[batch] = (best[0], best[1], best[2], best[3], steps)
+            if alloc > self._peak_alloc_gib:
+                self._peak_alloc_gib = alloc
+                logging.info(
+                    "[mem] new peak allocated: B=%d T=%d tokens=%d alloc=%.2f GiB reserved=%.2f GiB",
+                    batch,
+                    seq,
+                    batch * seq,
+                    alloc,
+                    reserved,
+                )
+        torch.cuda.reset_peak_memory_stats()
+        self._prev_step_shape = (int(batch_size), int(seq_len))
+
+    def _dump_bucket_memory(self) -> None:
+        """Log the per-bucket peak table, most expensive first."""
+        if not self._bucket_memory:
+            return
+        rows = sorted(self._bucket_memory.items(), key=lambda kv: -kv[1][0])
+        lines = ["[mem] peak allocated per bucket (worst step of each), most expensive first:"]
+        lines.append("[mem]   batch    seqlen    tokens   alloc_GiB   reserved_GiB   steps")
+        for batch, (alloc, reserved, seq, tokens, steps) in rows:
+            lines.append(
+                f"[mem] {batch:>7} {seq:>9} {tokens:>9} {alloc:>11.2f} {reserved:>14.2f} {steps:>7}"
+            )
+        logging.info("\n".join(lines))
+
+    def _maybe_snapshot_memory(self, batch_idx: int) -> None:
+        """Record a CUDA allocator trace over a few steps and dump it to a pickle.
+
+        The per-bucket table says *how much* a step costs but not *what* holds it. This
+        turns on ``torch.cuda.memory._record_memory_history``, which stamps every alloc
+        and free with its Python stack, so the dump can be opened at
+        https://docs.pytorch.org/memory_viz and read as "which tensor, allocated from
+        which line, was alive at the peak".
+
+        Opt-in and deliberately short-lived: the tracer adds per-allocation overhead and
+        the pickle grows with the number of events, so it covers
+        ``memory_snapshot_steps`` steps starting at ``memory_snapshot_at`` and then turns
+        itself off. Rank 0 only -- every rank holds the same shapes here, and one file is
+        enough.
+        """
+        at = int(self.cfg.get("memory_snapshot_at", 0))
+        if at <= 0 or not torch.cuda.is_available():
+            return
+        span = int(self.cfg.get("memory_snapshot_steps", 3))
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        if rank != 0:
+            return
+
+        if batch_idx == at:
+            torch.cuda.memory._record_memory_history(max_entries=200_000)
+            self._memory_snapshot_active = True
+            logging.info("[mem] memory history recording ON at step %d (%d steps)", at, span)
+        elif self._memory_snapshot_active and batch_idx >= at + span:
+            import os
+
+            out_dir = self.cfg.get("memory_snapshot_dir", None) or os.getcwd()
+            path = os.path.join(out_dir, f"memory_snapshot_step{batch_idx}.pickle")
+            try:
+                torch.cuda.memory._dump_snapshot(path)
+                logging.info("[mem] memory snapshot written to %s", path)
+            except Exception as e:  # noqa: BLE001 -- profiling must never kill a run
+                logging.warning("[mem] could not write the memory snapshot: %s", e)
+            finally:
+                torch.cuda.memory._record_memory_history(enabled=None)
+                self._memory_snapshot_active = False
 
     def _validate_parallelism_compatibility(self, *, check_backward: bool = True) -> None:
         """Raise on known-incompatible THD/CP/backend configurations.
@@ -534,14 +774,25 @@ class SALMAutomodel(LightningModule, HFHubMixin):
     def _training_step_batch(self, batch: dict, batch_idx: int):
         self._current_batch_idx = batch_idx
         self._apply_train_eval_modes()
+        # Before the forward, so the trace covers whole steps end to end.
+        self._maybe_snapshot_memory(batch_idx)
 
         inputs = self.prepare_inputs(batch)
         self._record_training_stats(batch, inputs)
-        forward_outputs = self(
-            inputs["input_embeds"],
-            attention_mask=inputs["attention_mask"],
-            **inputs.get("llm_kwargs", {}),
-        )
+        if self._fused_ce is not None:
+            forward_outputs = {
+                "hidden_states": self._forward_hidden_states(
+                    inputs["input_embeds"],
+                    attention_mask=inputs["attention_mask"],
+                    **inputs.get("llm_kwargs", {}),
+                )
+            }
+        else:
+            forward_outputs = self(
+                inputs["input_embeds"],
+                attention_mask=inputs["attention_mask"],
+                **inputs.get("llm_kwargs", {}),
+            )
         num_frames = (inputs["target_ids"] != -100).long().sum()
 
         # Match Automodel's training recipe: normalize CE by the *global* token count across
@@ -559,19 +810,27 @@ class SALMAutomodel(LightningModule, HFHubMixin):
             num_frames_global = num_frames
         num_frames_global = num_frames_global.clamp(min=1)
 
-        with loss_parallel():
-            logits = forward_outputs["logits"]
-            loss_sum = torch.nn.functional.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),  # BSHD (B,T,V) or THD (1,T,V) -> (*, V)
-                inputs["target_ids"].reshape(-1),  # BSHD (B,T) or THD (T,) -> (*,)
-                reduction="sum",
-                ignore_index=-100,
-            )
+        if self._fused_ce is not None:
+            loss_sum = self._fused_loss_sum(forward_outputs["hidden_states"], inputs["target_ids"])
             loss = loss_sum * dp_size / num_frames_global
+        else:
+            with loss_parallel():
+                logits = forward_outputs["logits"]
+                loss_sum = torch.nn.functional.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)),  # BSHD (B,T,V) or THD (1,T,V) -> (*, V)
+                    inputs["target_ids"].reshape(-1),  # BSHD (B,T) or THD (T,) -> (*,)
+                    reduction="sum",
+                    ignore_index=-100,
+                )
+                loss = loss_sum * dp_size / num_frames_global
+
         if (dummy_audio_loss := inputs.get("dummy_audio_loss")) is not None:
             loss = loss + dummy_audio_loss
 
-        # Latent speaker supervision loss (auxiliary, optional).
+        # Latent speaker supervision loss (auxiliary, optional). Not available when the fused
+        # CE path is active (see _setup_fused_cross_entropy): that path never materializes
+        # ``logits``, so lss_loss forces fused CE off at setup time and ``logits`` is always
+        # defined here.
         if self.lss_loss is not None and num_frames > 0:
             if isinstance(logits, DTensor):
                 logits = logits.full_tensor()
@@ -627,6 +886,9 @@ class SALMAutomodel(LightningModule, HFHubMixin):
             B, T = 1, input_embeds.shape[0]
         else:
             B, T = input_embeds.shape[:2]
+        self._profile_step_memory(B, T)
+        if self._bucket_memory and batch_idx > 0 and batch_idx % int(self.cfg.get("bucket_memory_every", 500)) == 0:
+            self._dump_bucket_memory()
         ans = {
             "loss": loss,
             "learning_rate": (
