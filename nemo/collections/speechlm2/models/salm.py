@@ -237,6 +237,20 @@ class SALM(LightningModule, HFHubMixin):
             raise Exception(f"Audio encoding failed {ids=} {lens=}")
         input_ids_to_embed = torch.where(batch["input_ids"] == self.audio_locator_tag_id, 0, batch["input_ids"])
         text_embs = self.embed_tokens(input_ids_to_embed)
+        if not audio_embs and self.training and any(p.requires_grad for p in self.perception.parameters()):
+            # This rank's mini-batch had zero audio rows (e.g. an all-text-only batch),
+            # so `self.perception` was never called above and its trainable submodules
+            # (modality_adapter, rote) got no gradient this step. Under DDP that makes
+            # this rank's set of "used" parameters differ from ranks that DID see audio,
+            # which manifests as an ALLREDUCE hang/timeout even with
+            # find_unused_parameters=True (observed: job 1599935, rank desync at
+            # SeqNum~880-923). Run a throwaway forward through the perception module and
+            # fold its (zeroed-out) output into text_embs so every rank always touches
+            # the same trainable parameters every step, regardless of batch composition.
+            dummy_len = torch.tensor([self.sampling_rate // 10], device=text_embs.device, dtype=torch.long)  # 100ms
+            dummy_signal = torch.zeros(1, dummy_len.item(), device=text_embs.device, dtype=torch.float32)
+            dummy_embs, _ = self.perception(input_signal=dummy_signal, input_signal_length=dummy_len)
+            text_embs = text_embs + dummy_embs.sum().to(text_embs.dtype) * 0.0
         input_embs, target_ids, attention_mask = replace_placeholders_and_build_targets(
             input_ids=batch["input_ids"],
             embeds=text_embs,
