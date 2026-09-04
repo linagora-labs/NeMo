@@ -163,6 +163,18 @@ def update_perception_output_dim(model):
         model.perception.proj = torch.nn.Linear(proj.in_features, hidden_size, bias=proj.bias is not None)
 
 
+# Once delete_embeddings() resolves an embedding location unambiguously (attribute
+# still present), the (parent, attr) pair is cached here keyed by id(unwrapped llm),
+# so a later find_embedding_layer() call (e.g. from move_embedding(), after the
+# attribute has been deleted) can look it up instead of re-guessing. This matters
+# because two candidates in paths_to_try can share the same parent object (e.g.
+# NemotronH's ['model', 'embeddings'] and dense Nemotron's ['model', 'embed_tokens']):
+# once the real attribute is gone, hasattr() can no longer tell them apart, and the
+# heuristic below would silently pick the wrong one (first-in-list) for architectures
+# that never had the earlier candidate's attribute in the first place.
+_deleted_embed_cache: Dict[int, tuple] = {}
+
+
 def find_embedding_layer(llm):
     """
     Locate the input embedding layer of an HF causal LM across architectures.
@@ -185,6 +197,11 @@ def find_embedding_layer(llm):
     # Unwrap PeftModel (LoRA) to reach the underlying base model.
     if isinstance(llm, PeftModel):
         llm = llm.base_model.model
+    # Trust a location previously resolved (unambiguously) by delete_embeddings()
+    # over the hasattr-based heuristic below — see _deleted_embed_cache docstring.
+    cached = _deleted_embed_cache.get(id(llm))
+    if cached is not None:
+        return cached
     # Two candidates share the ``model`` parent — NemotronH built-in (`model.embeddings`)
     # and Llama-family (`model.embed_tokens`). Disambiguate by preferring the candidate
     # whose embedding attribute is actually PRESENT. Only fall back to the first candidate
@@ -214,6 +231,8 @@ def delete_embeddings(llm) -> bool:
     parent, attr_name = find_embedding_layer(llm)
     if parent is not None and attr_name is not None and hasattr(parent, attr_name):
         delattr(parent, attr_name)
+        unwrapped = llm.base_model.model if isinstance(llm, PeftModel) else llm
+        _deleted_embed_cache[id(unwrapped)] = (parent, attr_name)
         return True
     return False
 
