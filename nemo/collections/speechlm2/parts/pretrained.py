@@ -289,6 +289,9 @@ def update_perception_output_dim(model):
         model.perception.proj = torch.nn.Linear(proj.in_features, hidden_size, bias=proj.bias is not None)
 
 
+_DELETED_EMBED_ATTR_MARKER = "_nemo_deleted_embed_attr_name"
+
+
 def find_embedding_layer(llm):
     """
     Locate the input embedding layer of an HF causal LM across architectures.
@@ -311,11 +314,19 @@ def find_embedding_layer(llm):
     # Unwrap PeftModel (LoRA) to reach the underlying base model.
     if isinstance(llm, PeftModel):
         llm = llm.base_model.model
+    # If ``delete_embeddings`` already removed the embedding from this model, its
+    # location was recorded on the parent module at that time — reuse it directly.
+    # Once the attribute is gone, several candidates below can share the same
+    # resolvable parent path (e.g. both NemotronH's and dense Nemotron's embedding
+    # live under ``.model``), so re-guessing from the path list alone is ambiguous
+    # and can pick the wrong candidate.
+    for module in llm.modules():
+        recorded_attr = getattr(module, _DELETED_EMBED_ATTR_MARKER, None)
+        if recorded_attr is not None:
+            return module, recorded_attr
     # Two candidates share the ``model`` parent — NemotronH built-in (`model.embeddings`)
     # and Llama-family (`model.embed_tokens`). Disambiguate by preferring the candidate
-    # whose embedding attribute is actually PRESENT. Only fall back to the first candidate
-    # whose parent path resolves when no attribute is present, which happens when the
-    # embedding was deleted (delete_embeddings) and we are locating it to restore it.
+    # whose embedding attribute is actually PRESENT.
     fallback = None
     for *parents, attr in paths_to_try:
         obj = llm
@@ -340,6 +351,7 @@ def delete_embeddings(llm) -> bool:
     parent, attr_name = find_embedding_layer(llm)
     if parent is not None and attr_name is not None and hasattr(parent, attr_name):
         delattr(parent, attr_name)
+        setattr(parent, _DELETED_EMBED_ATTR_MARKER, attr_name)
         return True
     return False
 
