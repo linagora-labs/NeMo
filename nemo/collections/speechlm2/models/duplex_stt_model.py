@@ -48,6 +48,7 @@ from nemo.collections.speechlm2.parts.pretrained import (
     set_model_dict_for_partial_init,
     setup_speech_encoder,
 )
+from nemo.collections.speechlm2.parts.special_rows_head import SpecialRowsHead
 from nemo.collections.speechlm2.streaming.duplex_stt_inference import DuplexSTTStreamingInference
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
 from nemo.utils import logging
@@ -111,6 +112,12 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             self.embed_asr_tokens = copy.deepcopy(self.embed_tokens)
 
         maybe_install_lora(self)
+
+        # Optionally freeze the LM head (and the tied embeddings) except a few rows, e.g. [pad, bos, eos].
+        # Installed before maybe_load_pretrained_models so that checkpoints restore the deltas.
+        if head_rows := self.cfg.get("trainable_head_rows", None):
+            row_ids = {"pad": self.text_pad_id, "bos": self.text_bos_id, "eos": self.text_eos_id}
+            self.lm_head = SpecialRowsHead(self.lm_head, [row_ids.get(r, r) for r in head_rows])
 
         # Load the pretrained streaming ASR model
         setup_speech_encoder(self, pretrained_weights=self.cfg.pretrained_weights)
@@ -695,6 +702,8 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                         logging.warning(f"Both config and fallback methods failed: {fallback_e}")
                         logging.warning("Skipping tensor parallel configuration for this attention layer")
 
+            if isinstance(self.lm_head, SpecialRowsHead):
+                raise NotImplementedError("trainable_head_rows is not supported with tensor parallelism.")
             for m in (self.lm_head,):
                 parallelize_module(
                     m,

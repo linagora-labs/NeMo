@@ -15,11 +15,12 @@
 
 import io
 import logging
+import os
 import random
 import re
 import warnings
 from copy import deepcopy
-from functools import partial
+from functools import lru_cache, partial
 from itertools import repeat
 from pathlib import Path
 from typing import KeysView, List, Mapping, Sequence, Tuple, Union
@@ -1998,3 +1999,123 @@ def read_nemo_tarred_to_duplex(config) -> tuple[CutSet, bool]:
     cuts = cuts.map(convert_fn)
 
     return cuts, is_tarred
+
+
+@lru_cache(maxsize=4)
+def _duplex_answer_tokenizer(path: str):
+    # Loaded lazily, once per dataloader worker.
+    from nemo.collections.common.tokenizers import AutoTokenizer
+
+    return AutoTokenizer(path, use_fast=True)
+
+
+def _convert_conversation_to_duplex(
+    conv,
+    tokenizer_path: str,
+    frame_length: float,
+    gap: float,
+    gap_jitter: float,
+    hold: float,
+    tail: float,
+    max_agent_tokens: int,
+):
+    """Helper for ``conversation_as_duplex``; module-level so that it can be pickled.
+
+    Returns ``None`` for conversations that cannot be converted (filtered out afterwards).
+    """
+    if not isinstance(conv, NeMoMultimodalConversation):
+        return None
+    audio = [t for t in conv.turns if isinstance(t, AudioTurn)]
+    if len(audio) != 1:
+        return None
+    answers = [t for t in conv.turns if isinstance(t, TextTurn) and t.role.lower() == "assistant"]
+    if len(answers) != 1 or conv.turns[-1] is not answers[0]:
+        return None
+    answer = answers[0].value.strip()
+    if not answer:
+        return None
+    n_tokens = len(_duplex_answer_tokenizer(tokenizer_path).text_to_ids(answer))
+    if n_tokens > max_agent_tokens:
+        return None
+    prompt = "\n".join(t.value.strip() for t in conv.turns if isinstance(t, TextTurn) and t.role.lower() == "user")
+
+    cut = audio[0].cut
+    user_end = cut.duration
+    agent_start = user_end + gap + random.Random(conv.id).uniform(0.0, gap_jitter)
+    # BOS + one token per frame, then `hold` before the EOS that the duplex datasets put at the end.
+    agent_dur = (n_tokens + 1) * frame_length + hold
+
+    cut.supervisions = [
+        SupervisionSegment(
+            id=f"{conv.id}-user", recording_id=cut.recording_id, start=0.0, duration=user_end, speaker="user", text=""
+        )
+    ]
+    # Lazy padding with silence: no audio is loaded here (bucketing buffers hold thousands of cuts).
+    duplex = cut.pad(duration=agent_start + agent_dur + tail, direction="right", preserve_id=True)
+    duplex.tracks[0].cut.supervisions.append(
+        SupervisionSegment(
+            id=f"{conv.id}-agent",
+            recording_id=cut.recording_id,
+            start=agent_start,
+            duration=agent_dur,
+            speaker="agent",
+            text=answer,
+        )
+    )
+    # Manifest ids repeat across datasets and one audio can back several examples.
+    duplex.id = f"{conv.id}__{cut.id}"
+    duplex.custom = {"system_prompt": prompt} if prompt else {}
+    duplex.task = "s2s_duplex"
+    return duplex
+
+
+def _is_not_none(item) -> bool:
+    return item is not None
+
+
+@data_type_parser(["conversation_as_duplex"])
+def read_conversation_as_duplex(config) -> tuple[CutSet, bool]:
+    """Read ``multimodal_conversation`` JSONL manifests as "listen, then answer" duplex examples.
+
+    Each single-audio-turn conversation (optional user text instruction + user audio -> assistant
+    text) becomes a duplex cut on the ``frame_length`` timeline:
+
+    * system prompt (``cut.custom["system_prompt"]``): the user text turns, if any;
+    * ``user`` supervision: the audio, lazily right-padded with silence;
+    * ``agent`` supervision: starts ``gap`` (+ uniform jitter) seconds after the audio ends and lasts
+      ``(n_answer_tokens + 1) * frame_length + hold`` seconds, so that the answer fits one token per frame
+      and EOS lands ``hold`` seconds after the last token.
+
+    The user supervision has empty text (no word alignment), so ``predict_user_text`` is not supported.
+    Conversations with several audio turns, no final assistant answer, or an answer longer than
+    ``max_agent_tokens`` tokens are dropped.
+
+    Input config YAML example (used inside an ``input_cfg`` list)::
+
+        - type: conversation_as_duplex
+          manifest_filepath: /path/to/train.jsonl
+          weight: 1.0
+          # optional (defaults shown)
+          tokenizer: null          # defaults to the LLM_MODEL environment variable
+          frame_length: 0.08
+          gap: 0.32
+          gap_jitter: 0.24
+          hold: 0.24
+          tail: 0.4
+          max_agent_tokens: 400
+    """
+    tokenizer_path = config.get("tokenizer", None) or os.environ.get("LLM_MODEL")
+    assert tokenizer_path, "conversation_as_duplex needs `tokenizer` in its config or the LLM_MODEL env variable."
+    cuts, is_tarred = read_multimodal_conversation_jsonl(config)
+    convert_fn = partial(
+        _convert_conversation_to_duplex,
+        tokenizer_path=tokenizer_path,
+        frame_length=config.get("frame_length", 0.08),
+        gap=config.get("gap", 0.32),
+        gap_jitter=config.get("gap_jitter", 0.24),
+        hold=config.get("hold", 0.24),
+        tail=config.get("tail", 0.4),
+        max_agent_tokens=config.get("max_agent_tokens", 400),
+    )
+    # apply_fn=None: the default (is_cut) would silently skip the conversations.
+    return cuts.map(convert_fn, apply_fn=None).filter(_is_not_none), is_tarred
