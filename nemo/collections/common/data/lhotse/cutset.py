@@ -2021,49 +2021,73 @@ def _convert_conversation_to_duplex(
 ):
     """Helper for ``conversation_as_duplex``; module-level so that it can be pickled.
 
-    Returns ``None`` for conversations that cannot be converted (filtered out afterwards).
+    Splits the conversation into exchanges (one or more user audio turns, then one assistant answer)
+    and lays them out on one timeline. Returns ``None`` when not even one exchange can be converted
+    (filtered out afterwards).
     """
     if not isinstance(conv, NeMoMultimodalConversation):
         return None
-    audio = [t for t in conv.turns if isinstance(t, AudioTurn)]
-    if len(audio) != 1:
-        return None
-    answers = [t for t in conv.turns if isinstance(t, TextTurn) and t.role.lower() == "assistant"]
-    if len(answers) != 1 or conv.turns[-1] is not answers[0]:
-        return None
-    answer = answers[0].value.strip()
-    if not answer:
-        return None
-    n_tokens = len(_duplex_answer_tokenizer(tokenizer_path).text_to_ids(answer))
-    if n_tokens > max_agent_tokens:
-        return None
-    prompt = "\n".join(t.value.strip() for t in conv.turns if isinstance(t, TextTurn) and t.role.lower() == "user")
+    turns = conv.turns
+    is_user_text = lambda t: isinstance(t, TextTurn) and t.role.lower() != "assistant"
+    is_answer = lambda t: isinstance(t, TextTurn) and t.role.lower() == "assistant"
 
-    cut = audio[0].cut
-    user_end = cut.duration
-    agent_start = user_end + gap + random.Random(conv.id).uniform(0.0, gap_jitter)
-    # BOS + one token per frame, then `hold` before the EOS that the duplex datasets put at the end.
-    agent_dur = (n_tokens + 1) * frame_length + hold
+    # User text before the first answer (instruction, text context) -> system prompt.
+    first_answer = next((i for i, t in enumerate(turns) if is_answer(t)), len(turns))
+    prompt = "\n".join(t.value.strip() for t in turns[:first_answer] if is_user_text(t))
 
-    cut.supervisions = [
-        SupervisionSegment(
-            id=f"{conv.id}-user", recording_id=cut.recording_id, start=0.0, duration=user_end, speaker="user", text=""
-        )
-    ]
-    # Lazy padding with silence: no audio is loaded here (bucketing buffers hold thousands of cuts).
-    duplex = cut.pad(duration=agent_start + agent_dur + tail, direction="right", preserve_id=True)
-    duplex.tracks[0].cut.supervisions.append(
-        SupervisionSegment(
-            id=f"{conv.id}-agent",
-            recording_id=cut.recording_id,
-            start=agent_start,
-            duration=agent_dur,
-            speaker="agent",
-            text=answer,
-        )
-    )
+    # Exchanges: [audio cuts], answer text. Stop at the first turn that cannot be placed on the timeline
+    # (user text after the first answer, an answer with no audio before it, an over-long answer) and
+    # keep the complete exchanges before it.
+    tokenizer = _duplex_answer_tokenizer(tokenizer_path)
+    exchanges, audios = [], []
+    for i, turn in enumerate(turns):
+        if isinstance(turn, AudioTurn):
+            audios.append(turn.cut)
+        elif is_answer(turn):
+            answer = turn.value.strip()
+            if not audios or not answer:
+                break
+            n_tokens = len(tokenizer.text_to_ids(answer))
+            if n_tokens > max_agent_tokens:
+                break
+            exchanges.append((audios, answer, n_tokens))
+            audios = []
+        elif i > first_answer:
+            break
+    if not exchanges:
+        return None
+
+    rng = random.Random(conv.id)
+    first = exchanges[0][0][0]
+    sups, timeline, t = [], None, 0.0
+    for k, (cuts, answer, n_tokens) in enumerate(exchanges):
+        user_start = t
+        for j, cut in enumerate(cuts):
+            if j > 0:
+                t += gap  # several audio turns in a row (e.g. question + audio context): one user turn
+            cut.supervisions = []
+            # Lazy padding/appending: no audio is loaded here (bucketing buffers hold thousands of cuts).
+            if timeline is None:
+                timeline = cut
+            else:
+                timeline = timeline.pad(duration=t, direction="right", preserve_id=True).append(cut)
+            t += cut.duration
+        sups.append(SupervisionSegment(id=f"{conv.id}-user{k}", recording_id=first.recording_id,
+                                       start=user_start, duration=t - user_start, speaker="user", text=""))
+        agent_start = t + gap + rng.uniform(0.0, gap_jitter)
+        # BOS + one token per frame, then `hold` before the EOS that the duplex datasets put at the end.
+        agent_dur = (n_tokens + 1) * frame_length + hold
+        sups.append(SupervisionSegment(id=f"{conv.id}-agent{k}", recording_id=first.recording_id,
+                                       start=agent_start, duration=agent_dur, speaker="agent", text=answer))
+        # The user's next turn starts after the agent's EOS.
+        t = agent_start + agent_dur + gap + rng.uniform(0.0, gap_jitter)
+    agent_end = sups[-1].end
+
+    duplex = timeline.pad(duration=agent_end + tail, direction="right", preserve_id=True)
+    # All supervisions live on the first track (offset 0), with absolute times on the timeline.
+    duplex.tracks[0].cut.supervisions = sups
     # Manifest ids repeat across datasets and one audio can back several examples.
-    duplex.id = f"{conv.id}__{cut.id}"
+    duplex.id = f"{conv.id}__{first.id}"
     duplex.custom = {"system_prompt": prompt} if prompt else {}
     duplex.task = "s2s_duplex"
     return duplex
@@ -2077,18 +2101,24 @@ def _is_not_none(item) -> bool:
 def read_conversation_as_duplex(config) -> tuple[CutSet, bool]:
     """Read ``multimodal_conversation`` JSONL manifests as "listen, then answer" duplex examples.
 
-    Each single-audio-turn conversation (optional user text instruction + user audio -> assistant
-    text) becomes a duplex cut on the ``frame_length`` timeline:
+    A conversation is split into exchanges (one or more user audio turns, then one assistant answer),
+    laid out on one ``frame_length`` timeline (single- and multi-turn alike)::
 
-    * system prompt (``cut.custom["system_prompt"]``): the user text turns, if any;
-    * ``user`` supervision: the audio, lazily right-padded with silence;
-    * ``agent`` supervision: starts ``gap`` (+ uniform jitter) seconds after the audio ends and lasts
+        user audio 1 | gap | agent answer 1 ... EOS | gap | user audio 2 | gap | agent answer 2 ... EOS
+
+    * system prompt (``cut.custom["system_prompt"]``): the user text turns before the first answer
+      (instruction, text context), if any;
+    * ``user`` supervisions: the audio turns, lazily laid out with silence in between (consecutive audio
+      turns, e.g. question + audio context, form one user turn separated by ``gap``);
+    * ``agent`` supervisions: start ``gap`` (+ uniform jitter) seconds after the user turn ends and last
       ``(n_answer_tokens + 1) * frame_length + hold`` seconds, so that the answer fits one token per frame
-      and EOS lands ``hold`` seconds after the last token.
+      and EOS lands ``hold`` seconds after the last token. The next user turn starts ``gap`` (+ jitter)
+      after that EOS.
 
-    The user supervision has empty text (no word alignment), so ``predict_user_text`` is not supported.
-    Conversations with several audio turns, no final assistant answer, or an answer longer than
-    ``max_agent_tokens`` tokens are dropped.
+    The user supervisions have empty text (no word alignment), so ``predict_user_text`` is not supported.
+    The conversation is truncated before the first turn that cannot be placed on the timeline (user text
+    after the first answer, an answer without audio before it, an answer longer than ``max_agent_tokens``
+    tokens); conversations without one complete exchange are dropped.
 
     Input config YAML example (used inside an ``input_cfg`` list)::
 
