@@ -24,7 +24,7 @@ from torch import Tensor
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import loss_parallel
-from transformers import GenerationConfig
+from transformers import AutoConfig, GenerationConfig
 
 from nemo.collections.common.prompts import PromptFormatter
 from nemo.collections.common.tokenizers import AutoTokenizer
@@ -1581,7 +1581,14 @@ class SALMAutomodel(LightningModule, HFHubMixin):
             # MTP head in config.json. Explicitly override its depth to zero so
             # users who omit the block or set ``mtp.enabled: false`` do not pay
             # the MTP memory/compute cost during SpeechLM fine-tuning.
-            automodel_kwargs["num_nextn_predict_layers"] = 0
+            # Only for configs that define the field: HF from_pretrained hands an
+            # unknown config kwarg to the model __init__, and configs without MTP
+            # (e.g. dense Nemotron, model_type=nemotron) reject it with a TypeError.
+            llm_config = AutoConfig.from_pretrained(
+                self.cfg.pretrained_llm, trust_remote_code=self.cfg.get("trust_remote_code", False)
+            )
+            if hasattr(llm_config, "num_nextn_predict_layers"):
+                automodel_kwargs["num_nextn_predict_layers"] = 0
 
         self.llm = load_pretrained_automodel_llm(
             self.cfg.pretrained_llm,
@@ -1606,7 +1613,7 @@ class SALMAutomodel(LightningModule, HFHubMixin):
             # serialized depth. The built MTPConfig retains that logical count;
             # restore the HF config to the one physical layer saved in the state dict.
             self.llm.config.num_nextn_predict_layers = physical_depth
-        if not mtp_requested:
+        if not mtp_requested and "num_nextn_predict_layers" in automodel_kwargs:
             # The constructor override suppresses a checkpoint-native MTP module but does
             # not mutate the HF config. Keep the serialized config consistent with the
             # actual state dict so conversion/reload does not recreate a missing head.
