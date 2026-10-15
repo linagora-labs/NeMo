@@ -223,6 +223,8 @@ class DuplexSTTDataset(torch.utils.data.Dataset):
             "source_texts": [""],
             "target_texts": [""],
             "task": ["s2s_duplex"],
+            "agent_loss_mask": torch.ones(1),
+            "asr_loss_mask": torch.ones(1),
         }
 
     def __getitem__(self, all_cuts: CutSet) -> dict:
@@ -335,6 +337,14 @@ class DuplexSTTDataset(torch.utils.data.Dataset):
                     for cut in all_cuts_combined
                 ],
                 "task": [getattr(cut, "task", "s2s_duplex") for cut in all_cuts_combined],
+                # Per-example loss switches (conversation_as_duplex): 0 = this channel is not trained on
+                # the example. Default 1, i.e. both channels, for the other data types.
+                "agent_loss_mask": torch.tensor(
+                    [float((cut.custom or {}).get("agent_loss", True)) for cut in all_cuts_combined]
+                ),
+                "asr_loss_mask": torch.tensor(
+                    [float((cut.custom or {}).get("asr_loss", True)) for cut in all_cuts_combined]
+                ),
             }
 
             if torch.sum(prompt_token_lens) > 0:
@@ -702,7 +712,9 @@ def _expand_text_with_timestamps_and_word_lengths(
     word_align_position='left',
 ):
     def discretize_time(start_token, speech_frame_rate=0.08, timestamp_frame_rate=0.08):
-        return int(start_token * timestamp_frame_rate / speech_frame_rate)
+        # round, not int: 29 * 0.08 / 0.08 == 28.999999999999996 put words one frame early, over the
+        # previous word's last token.
+        return int(round(start_token * timestamp_frame_rate / speech_frame_rate))
 
     if pad_id is None:
         raise ValueError("pad_id must be provided.")

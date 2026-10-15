@@ -170,10 +170,16 @@ class DuplexSTTStreamingInference:
             cache=inference_state["cache"],
         )
 
-        if inference_state["start_gen_pos"] == 0:
-            inference_state["gen_text"][:, 0] = ans["text_logits"][:, -1].argmax(dim=-1)
-            if self.model.predict_user_text:
-                inference_state["gen_asr"][:, 0] = ans["asr_logits"][:, -1].argmax(dim=-1)
+        # Per example: in a batch mixing examples with and without a system prompt, those without one
+        # generate from position 0 (their gen_text[:, 0] would otherwise stay uninitialized).
+        is_prompt = inference_state["is_prompt_position_mask"][:, 0]
+        inference_state["gen_text"][:, 0] = torch.where(
+            is_prompt, inference_state["gen_text"][:, 0], ans["text_logits"][:, -1].argmax(dim=-1)
+        )
+        if self.model.predict_user_text:
+            inference_state["gen_asr"][:, 0] = torch.where(
+                is_prompt, inference_state["gen_asr"][:, 0], ans["asr_logits"][:, -1].argmax(dim=-1)
+            )
 
         return ans, inference_state
 
@@ -370,17 +376,25 @@ class DuplexSTTStreamingInference:
         input_pad_len: int = 0,
         prompt_tokens: torch.Tensor = None,
         prompt_token_lens: torch.Tensor = None,
+        silent_agent: torch.Tensor = None,
     ) -> dict[str, torch.Tensor]:
         """
         Autoregressive prediction (text only).
+        ``silent_agent``: optional (B,) bool mask of examples whose agent channel is forced to pad.
         """
         inference_state = self._init_inference(
             input_signal, input_signal_lens, input_pad_len, prompt_tokens, prompt_token_lens
         )
+        if silent_agent is not None and not silent_agent.any():
+            silent_agent = None
 
         ans, inference_state = self._step_zero(inference_state)
+        if silent_agent is not None:
+            inference_state["gen_text"][silent_agent, 0] = self.model.text_pad_id
 
         for t in range(1, inference_state["T"]):
             ans = self._step_inference(t, inference_state, ans)
+            if silent_agent is not None:
+                inference_state["gen_text"][silent_agent, t] = self.model.text_pad_id
 
         return self._post_inference(inference_state, prompt_token_lens)

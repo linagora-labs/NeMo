@@ -48,7 +48,7 @@ from nemo.collections.speechlm2.parts.pretrained import (
     set_model_dict_for_partial_init,
     setup_speech_encoder,
 )
-from nemo.collections.speechlm2.parts.special_rows_head import SpecialRowsHead
+from nemo.collections.speechlm2.parts.special_rows_head import SpecialRowsEmbedding, SpecialRowsHead
 from nemo.collections.speechlm2.streaming.duplex_stt_inference import DuplexSTTStreamingInference
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
 from nemo.utils import logging
@@ -107,17 +107,43 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         self.embed_tokens = getattr(self.llm, embed_tokens_attr_name)
         delattr(self.llm, embed_tokens_attr_name)
 
+        head_rows = self.cfg.get("trainable_head_rows", None)
+        share_asr_embed = self.predict_user_text and self.cfg.get("share_asr_embeddings", False)
+        assert not share_asr_embed or head_rows, "share_asr_embeddings needs trainable_head_rows"
         if self.predict_user_text:
-            self.asr_head = copy.deepcopy(self.lm_head)
-            self.embed_asr_tokens = copy.deepcopy(self.embed_tokens)
+            # With trainable_head_rows, the ASR head is built below on the same frozen base as lm_head
+            # (and, with share_asr_embeddings, the ASR channel input embedding on embed_tokens).
+            if not head_rows:
+                self.asr_head = copy.deepcopy(self.lm_head)
+            if not share_asr_embed:
+                self.embed_asr_tokens = copy.deepcopy(self.embed_tokens)
 
         maybe_install_lora(self)
 
         # Optionally freeze the LM head (and the tied embeddings) except a few rows, e.g. [pad, bos, eos].
         # Installed before maybe_load_pretrained_models so that checkpoints restore the deltas.
-        if head_rows := self.cfg.get("trainable_head_rows", None):
+        if head_rows:
             row_ids = {"pad": self.text_pad_id, "bos": self.text_bos_id, "eos": self.text_eos_id}
-            self.lm_head = SpecialRowsHead(self.lm_head, [row_ids.get(r, r) for r in head_rows])
+            row_ids = [row_ids.get(r, r) for r in head_rows]
+            self.lm_head = SpecialRowsHead(self.lm_head, row_ids)
+            if self.predict_user_text:
+                # Same frozen base (shared, not copied: a fully trainable copy collapses to <pad> like
+                # lm_head would), its own trainable special rows.
+                self.asr_head = SpecialRowsHead(self.lm_head.base, row_ids)
+            if share_asr_embed:
+                # Frozen embed_tokens (tied to the frozen head) + a trainable channel vector and special rows,
+                # instead of a trainable copy of the whole table.
+                self.embed_asr_tokens = SpecialRowsEmbedding(self.embed_tokens, row_ids)
+
+        # Optional low-rank residual adapter on the hidden state read by the ASR head, so that the agent
+        # and ASR heads do not have to share one view of it. Zero-initialized up projection: a no-op at start.
+        self.asr_head_adapter = None
+        if self.predict_user_text and (rank := self.cfg.get("asr_head_adapter_rank", 0)):
+            hidden = self.lm_head.weight.shape[1]
+            self.asr_head_adapter = torch.nn.Sequential(
+                torch.nn.Linear(hidden, rank, bias=False), torch.nn.Linear(rank, hidden, bias=False)
+            )
+            torch.nn.init.zeros_(self.asr_head_adapter[1].weight)
 
         # Load the pretrained streaming ASR model
         setup_speech_encoder(self, pretrained_weights=self.cfg.pretrained_weights)
@@ -189,6 +215,8 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         asr_logits = None
         if self.predict_user_text:
             asr_in = out['last_hidden_state']
+            if self.asr_head_adapter is not None:
+                asr_in = asr_in + self.asr_head_adapter(asr_in)
             asr_logits = self.asr_head(asr_in)  # (B, T, asr_vocab_size)
 
         if not self.training:
@@ -276,6 +304,14 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         if self.predict_user_text:
             asr_inputs = inputs["asr_inputs"]
             asr_labels = inputs["asr_labels"]
+            # Teacher forcing alone lets the ASR head time its words from its own transcript history; in free
+            # running a missed word leaves it a <pad>-only history and it never starts again. Replacing text
+            # tokens of the ASR channel input by <pad> makes it find the words in the audio (labels unchanged).
+            if self.training and (p := self.cfg.get("asr_input_dropout", 0.0)) > 0:
+                is_text = (asr_inputs != self.text_pad_id) & (asr_inputs != self.text_bos_id)
+                is_text &= asr_inputs != self.text_eos_id
+                drop = is_text & (torch.rand(asr_inputs.shape, device=asr_inputs.device) < p)
+                asr_inputs = asr_inputs.masked_fill(drop, self.text_pad_id)
 
         input_embeds = self.embed_tokens(text_inputs) * self.cfg.get("duplex_text_channel_weight", 1.0)
         input_embeds.add_(source_encoded[:, :-1] * self.cfg.get("duplex_user_channel_weight", 1.0))
@@ -326,6 +362,13 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     )
                     * seq_mask.float()
                 )
+
+        # Per-example switches from the dataset (conversation_as_duplex): ASR-only examples do not train
+        # the agent channel, examples without a word-aligned user transcript do not train the ASR head.
+        if (mask := batch.get("agent_loss_mask")) is not None:
+            loss_scale = loss_scale * mask.to(loss_scale)[:, None, None]
+        if self.predict_user_text and (mask := batch.get("asr_loss_mask")) is not None:
+            asr_loss_scale = asr_loss_scale * mask.to(asr_loss_scale)[:, None, None]
 
         ans = {
             "input_embeds": input_embeds,
@@ -507,28 +550,46 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             prompt_tokens = dataset_batch.get("prompt_tokens", None)
             prompt_token_lens = dataset_batch.get("prompt_token_lens", None)
 
+            # Examples whose agent is not trained on (agent_loss: false, e.g. ASR) decode with a silent agent:
+            # its output would otherwise be fed back and blur the ASR-head metrics.
+            agent_mask = dataset_batch.get("agent_loss_mask")
             results = self.streaming_inference.offline_inference(
                 dataset_batch["source_audio"],
                 dataset_batch["source_audio_lens"],
                 prompt_tokens=prompt_tokens,
                 prompt_token_lens=prompt_token_lens,
+                silent_agent=None if agent_mask is None else agent_mask == 0,
             )
 
             # Strip timestamps for metrics
             text_clean = [re.sub(r"<[\|$].*?[\|$]>", "", s).strip() for s in results["text"]]
 
+            # Metrics only on the examples that have a reference for that channel: ASR-only examples have
+            # no agent answer, examples without a word-aligned transcript no user text.
+            has_agent = [i for i, t in enumerate(dataset_batch["target_texts"]) if t.strip()]
+            has_user = [i for i, t in enumerate(dataset_batch["source_texts"]) if t.strip()]
+
             # Agent text metrics
-            self.bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=text_clean)
-            if "source_tokens" in dataset_batch and results["tokens_text"] is not None:
-                self.turn_taking_metrics.update(
-                    name=name, source_tokens=dataset_batch["source_tokens"], pred_tokens=results["tokens_text"]
+            if has_agent:
+                self.bleu.update(
+                    name=name,
+                    refs=[dataset_batch["target_texts"][i] for i in has_agent],
+                    hyps=[text_clean[i] for i in has_agent],
                 )
+                if "source_tokens" in dataset_batch and results["tokens_text"] is not None:
+                    self.turn_taking_metrics.update(
+                        name=name,
+                        source_tokens=dataset_batch["source_tokens"][has_agent],
+                        pred_tokens=results["tokens_text"][has_agent],
+                    )
 
             # User text metrics
-            if self.predict_user_text:
-                self.src_bleu.update(name=name, refs=dataset_batch["source_texts"], hyps=results["src_text"])
-                self.src_wer.update(name=name, refs=dataset_batch["source_texts"], hyps=results["src_text"])
-                self.empty_user_text.update(name=name, hyps=results["src_text"])
+            if self.predict_user_text and has_user:
+                refs = [dataset_batch["source_texts"][i] for i in has_user]
+                hyps = [results["src_text"][i] for i in has_user]
+                self.src_bleu.update(name=name, refs=refs, hyps=hyps)
+                self.src_wer.update(name=name, refs=refs, hyps=hyps)
+                self.empty_user_text.update(name=name, hyps=hyps)
 
             self.results_logger.update(
                 name=name,

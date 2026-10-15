@@ -28,7 +28,7 @@ from typing import KeysView, List, Mapping, Sequence, Tuple, Union
 import numpy as np
 import omegaconf
 import soundfile as sf
-from lhotse import CutSet, Features, MonoCut, Recording, SupervisionSegment
+from lhotse import CutSet, Features, MonoCut, Recording, SupervisionSegment, compute_num_frames
 from lhotse.array import Array, TemporalArray
 from lhotse.cut import Cut, MixedCut, PaddingCut
 from lhotse.lazy import LazyIteratorChain
@@ -2009,6 +2009,27 @@ def _duplex_answer_tokenizer(path: str):
     return AutoTokenizer(path, use_fast=True)
 
 
+def _user_text_with_timestamps(words, tokenizer, frame_length: float, sup_start: float, sampling_rate: int):
+    """Timestamped user text (``<|i|> word <|j|>``) for the ASR head, and the timeline time its last token needs.
+
+    ``words`` are ``(word, start, end)`` with times on the timeline. A word's tokens are emitted from its end
+    (once heard), one per frame, and pushed later while the previous word's tokens are still being emitted.
+    The duplex dataset (``_build_token_channel``) writes BOS at the supervision start frame and the
+    timestamped tokens one frame after it, so frame indices are relative to ``supervision start + 1``.
+    Word token counts follow its tokenization (``prepend_word_space``: a space before every word but the first).
+    """
+    pos = compute_num_frames(sup_start, frame_length, sampling_rate)
+    parts, next_free = [], pos + 1
+    for k, (word, _, end) in enumerate(words):
+        n_tokens = max(len(tokenizer.text_to_ids(word if k == 0 else " " + word)), 1)
+        first = max(compute_num_frames(end, frame_length, sampling_rate), next_free)
+        rel = first - pos - 1
+        parts.append(f"<|{rel}|> {word} <|{rel + n_tokens}|>")
+        next_free = first + n_tokens
+    # The EOS goes at the supervision end frame: it must come after the last token.
+    return " ".join(parts), next_free * frame_length
+
+
 def _convert_conversation_to_duplex(
     conv,
     tokenizer_path: str,
@@ -2018,6 +2039,9 @@ def _convert_conversation_to_duplex(
     hold: float,
     tail: float,
     max_agent_tokens: int,
+    asr_only: bool = False,
+    agent_loss: bool = True,
+    asr_loss: bool = True,
 ):
     """Helper for ``conversation_as_duplex``; module-level so that it can be pickled.
 
@@ -2031,19 +2055,30 @@ def _convert_conversation_to_duplex(
     is_user_text = lambda t: isinstance(t, TextTurn) and t.role.lower() != "assistant"
     is_answer = lambda t: isinstance(t, TextTurn) and t.role.lower() == "assistant"
 
+    # Word timestamps of the user audio turns (one list per audio turn, in order), if aligned.
+    user_words = (conv.custom or {}).get("user_words")
+    n_audio = sum(isinstance(t, AudioTurn) for t in turns)
+    if user_words is not None and len(user_words) != n_audio:
+        user_words = None
+    if asr_only and user_words is None:
+        return None
+
     # User text before the first answer (instruction, text context) -> system prompt.
     first_answer = next((i for i, t in enumerate(turns) if is_answer(t)), len(turns))
     prompt = "\n".join(t.value.strip() for t in turns[:first_answer] if is_user_text(t))
 
-    # Exchanges: [audio cuts], answer text. Stop at the first turn that cannot be placed on the timeline
-    # (user text after the first answer, an answer with no audio before it, an over-long answer) and
-    # keep the complete exchanges before it.
+    # Exchanges: [(audio cut, its user_words index)], answer text. Stop at the first turn that cannot be
+    # placed on the timeline (user text after the first answer, an answer with no audio before it, an
+    # over-long answer) and keep the complete exchanges before it. ASR-only: the audio turns, no answer.
     tokenizer = _duplex_answer_tokenizer(tokenizer_path)
-    exchanges, audios = [], []
+    exchanges, audios, n_seen = [], [], 0
     for i, turn in enumerate(turns):
         if isinstance(turn, AudioTurn):
-            audios.append(turn.cut)
+            audios.append((turn.cut, n_seen))
+            n_seen += 1
         elif is_answer(turn):
+            if asr_only:
+                continue
             answer = turn.value.strip()
             if not audios or not answer:
                 break
@@ -2052,19 +2087,23 @@ def _convert_conversation_to_duplex(
                 break
             exchanges.append((audios, answer, n_tokens))
             audios = []
-        elif i > first_answer:
+        elif i > first_answer and not asr_only:
             break
+    if asr_only and audios:
+        exchanges.append((audios, None, 0))
     if not exchanges:
         return None
 
     rng = random.Random(conv.id)
-    first = exchanges[0][0][0]
+    first = exchanges[0][0][0][0]
     sups, timeline, t = [], None, 0.0
     for k, (cuts, answer, n_tokens) in enumerate(exchanges):
-        user_start = t
-        for j, cut in enumerate(cuts):
+        user_start, words = t, []
+        for j, (cut, audio_idx) in enumerate(cuts):
             if j > 0:
                 t += gap  # several audio turns in a row (e.g. question + audio context): one user turn
+            if user_words is not None:
+                words.extend((w, t + start, t + end) for w, start, end in user_words[audio_idx])
             cut.supervisions = []
             # Lazy padding/appending: no audio is loaded here (bucketing buffers hold thousands of cuts).
             if timeline is None:
@@ -2072,8 +2111,16 @@ def _convert_conversation_to_duplex(
             else:
                 timeline = timeline.pad(duration=t, direction="right", preserve_id=True).append(cut)
             t += cut.duration
+        user_text = ""
+        if words:
+            user_text, text_end = _user_text_with_timestamps(
+                words, tokenizer, frame_length, user_start, first.sampling_rate
+            )
+            t = max(t, text_end)  # the user turn (and its EOS) lasts until its last transcript token
         sups.append(SupervisionSegment(id=f"{conv.id}-user{k}", recording_id=first.recording_id,
-                                       start=user_start, duration=t - user_start, speaker="user", text=""))
+                                       start=user_start, duration=t - user_start, speaker="user", text=user_text))
+        if answer is None:
+            break
         agent_start = t + gap + rng.uniform(0.0, gap_jitter)
         # BOS + one token per frame, then `hold` before the EOS that the duplex datasets put at the end.
         agent_dur = (n_tokens + 1) * frame_length + hold
@@ -2081,14 +2128,21 @@ def _convert_conversation_to_duplex(
                                        start=agent_start, duration=agent_dur, speaker="agent", text=answer))
         # The user's next turn starts after the agent's EOS.
         t = agent_start + agent_dur + gap + rng.uniform(0.0, gap_jitter)
-    agent_end = sups[-1].end
+    end = sups[-1].end
 
-    duplex = timeline.pad(duration=agent_end + tail, direction="right", preserve_id=True)
+    duplex = timeline.pad(duration=end + tail, direction="right", preserve_id=True)
     # All supervisions live on the first track (offset 0), with absolute times on the timeline.
     duplex.tracks[0].cut.supervisions = sups
     # Manifest ids repeat across datasets and one audio can back several examples.
     duplex.id = f"{conv.id}__{first.id}"
-    duplex.custom = {"system_prompt": prompt} if prompt else {}
+    # Per-example loss switches (per dataset, from the input_cfg), read by DuplexSTTDataset. With the loss
+    # off, the channel is still built (its tokens are the input of the next frame), only not predicted.
+    # No ASR-head loss without a word-aligned user transcript.
+    # Assigned in one go: MixedCut.custom returns a merged copy, so item assignment on it would be lost.
+    custom = {"agent_loss": agent_loss, "asr_loss": asr_loss and user_words is not None}
+    if prompt and not asr_only:
+        custom["system_prompt"] = prompt
+    duplex.custom = custom
     duplex.task = "s2s_duplex"
     return duplex
 
@@ -2115,7 +2169,21 @@ def read_conversation_as_duplex(config) -> tuple[CutSet, bool]:
       and EOS lands ``hold`` seconds after the last token. The next user turn starts ``gap`` (+ jitter)
       after that EOS.
 
-    The user supervisions have empty text (no word alignment), so ``predict_user_text`` is not supported.
+    User transcript (``predict_user_text``): when the conversation has ``custom.user_words`` (one list of
+    ``[word, start, end]`` per audio turn, seconds from the start of that turn, as written by Luciole's
+    ``training/test_duplex/alignment/align_asr_manifests.py``), the user supervisions carry it as
+    timestamped text. Each word's tokens are emitted from the word's end, one per frame, pushed later
+    while the previous word's are still being emitted; the user turn is extended until its last token.
+    Without ``user_words`` the user text is empty and ``cut.custom["asr_loss"]`` is False.
+
+    ``asr_only: true`` (ASR datasets): only the audio turns and their transcript, no system prompt and no
+    agent turn. Conversations without ``user_words`` are dropped.
+
+    Loss switches (``cut.custom["agent_loss"]`` / ``["asr_loss"]``, read by DuplexSTTDataset): ``agent_loss:
+    false`` does not train the agent head on the dataset (e.g. ASR: an empty agent channel would teach it to
+    stay silent after speech, against the QA data without a system prompt); ``asr_loss: false`` keeps the
+    user transcript as the ASR channel input but does not train the ASR head on it (e.g. pseudo-transcripts
+    with too many errors).
     The conversation is truncated before the first turn that cannot be placed on the timeline (user text
     after the first answer, an answer without audio before it, an answer longer than ``max_agent_tokens``
     tokens); conversations without one complete exchange are dropped.
@@ -2133,6 +2201,9 @@ def read_conversation_as_duplex(config) -> tuple[CutSet, bool]:
           hold: 0.24
           tail: 0.4
           max_agent_tokens: 400
+          asr_only: false
+          agent_loss: true
+          asr_loss: true
     """
     tokenizer_path = config.get("tokenizer", None) or os.environ.get("LLM_MODEL")
     assert tokenizer_path, "conversation_as_duplex needs `tokenizer` in its config or the LLM_MODEL env variable."
@@ -2146,6 +2217,9 @@ def read_conversation_as_duplex(config) -> tuple[CutSet, bool]:
         hold=config.get("hold", 0.24),
         tail=config.get("tail", 0.4),
         max_agent_tokens=config.get("max_agent_tokens", 400),
+        asr_only=config.get("asr_only", False),
+        agent_loss=config.get("agent_loss", True),
+        asr_loss=config.get("asr_loss", True),
     )
     # apply_fn=None: the default (is_cut) would silently skip the conversations.
     return cuts.map(convert_fn, apply_fn=None).filter(_is_not_none), is_tarred
