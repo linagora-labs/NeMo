@@ -2142,6 +2142,9 @@ def _convert_conversation_to_duplex(
     custom = {"agent_loss": agent_loss, "asr_loss": asr_loss and user_words is not None}
     if prompt and not asr_only:
         custom["system_prompt"] = prompt
+        # The model prepends the prompt (BOS + tokens + EOS, one frame each) to the timeline, which
+        # cut.duration does not cover: MultimodalSamplingConstraint adds this to the batch size measure.
+        custom["prompt_frames"] = len(tokenizer.text_to_ids(prompt)) + 2
     duplex.custom = custom
     duplex.task = "s2s_duplex"
     return duplex

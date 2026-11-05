@@ -83,6 +83,11 @@ class MultimodalSamplingConstraint(SamplingConstraint):
     def measure_length(self, example: Any) -> float:
         if isinstance(example, Cut):
             audio_len_in_tokens = math.ceil(example.duration / self.token_equivalent_duration)
+            # Duplex examples (``conversation_as_duplex``): the model prepends the system prompt to the frame
+            # sequence, one frame per token, and neither cut.duration nor the supervisions cover it. With a long
+            # prompt (e.g. a text context), a bucket of short examples would exceed ``batch_tokens`` several
+            # times over (OOM).
+            audio_len_in_tokens += (getattr(example, "custom", None) or {}).get("prompt_frames", 0)
             if self.measure_total_length:
                 # Total length of a Cut (audio+text example) is counted as the sum of:
                 # * num_tokens in each supervision segment ("utterance") in the Cut
