@@ -283,6 +283,10 @@ class LhotseDataLoadingConfig:
     # (DynamicBucketingSampler / DynamicCutSampler), this enables exact resume from the next batch
     # within the current epoch via the standard PyTorch state_dict / load_state_dict protocol.
     use_stateful_dataloader: bool = False
+    # StatefulDataLoader: how often (in batches) the workers send their state to the main process.
+    # 1 (torchdata default) = after every batch. Resume stays exact with a larger value: the workers
+    # replay the batches produced since the last snapshot.
+    snapshot_every_n_steps: int = 1
 
 
 def resolve_excluded_speaker_ids(excluded_speaker_ids):
@@ -327,6 +331,7 @@ def determine_use_iterable_dataset(use_iterable_dataset: bool, config: DictConfi
 def _build_dataloader(
     use_stateful_dataloader: bool,
     *,
+    snapshot_every_n_steps: int = 1,
     dp_rank: Optional[int] = None,
     dp_world_size: Optional[int] = None,
     dp_group: Optional[Any] = None,
@@ -348,6 +353,7 @@ def _build_dataloader(
     if use_stateful_dataloader:
         from torchdata.stateful_dataloader import StatefulDataLoader
 
+        kwargs["snapshot_every_n_steps"] = snapshot_every_n_steps
         if dp_world_size is not None and dp_world_size > 1:
             return _PerRankStatefulDataLoader(
                 dp_rank=dp_rank if dp_rank is not None else 0,
@@ -610,6 +616,7 @@ def get_lhotse_dataloader_from_single_config(
         dloader_kwargs = dict(dataset=dataset, sampler=sampler)
     dloader = _build_dataloader(
         use_stateful_dataloader=config.use_stateful_dataloader,
+        snapshot_every_n_steps=config.get("snapshot_every_n_steps", 1),
         dp_rank=global_rank,
         dp_world_size=world_size,
         dp_group=dp_group,
@@ -665,6 +672,7 @@ def get_lhotse_dataloader_from_multi_config(
             "metadata_only",
             "force_finite",
             "use_stateful_dataloader",
+            "snapshot_every_n_steps",
             # Indexed dataloading flags must propagate too — otherwise a
             # top-level ``indexed: true`` / ``indexes_root: /tmp/idx`` on the
             # train_ds namespace silently fails to reach sub-configs, and the
@@ -749,6 +757,7 @@ def get_lhotse_dataloader_from_multi_config(
         dloader_kwargs = dict(dataset=dataset, sampler=sampler)
     dloader = _build_dataloader(
         use_stateful_dataloader=shared_opts.use_stateful_dataloader,
+        snapshot_every_n_steps=shared_opts.snapshot_every_n_steps,
         dp_rank=global_rank,
         dp_world_size=world_size,
         dp_group=dp_group,
