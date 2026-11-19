@@ -131,6 +131,10 @@ class SALM(LightningModule, HFHubMixin):
         self._use_fsdp = False
         self._use_tp = False
         self._fused_ce = None  # set in on_fit_start, see _fused_ce_loss_sum
+        # Per-bucket peak memory report (model.bucket_memory_every), see _profile_step_memory.
+        self._bucket_memory: dict[int, tuple[float, float, int, int, int]] = {}
+        self._prev_step_shape: tuple[int, int] | None = None
+        self._peak_alloc_gib = 0.0
 
     def on_fit_start(self) -> None:
         super().on_fit_start()
@@ -158,6 +162,43 @@ class SALM(LightningModule, HFHubMixin):
         base = self.llm.base_model.model if isinstance(self.llm, PeftModel) else self.llm
         hidden = base.model(inputs_embeds=input_embeds, attention_mask=attention_mask, use_cache=False).last_hidden_state
         return self._fused_ce(base.lm_head.weight, hidden.flatten(0, 1), target_ids.flatten(0, 1))
+
+    def _profile_step_memory(self, batch_size: int, seq_len: int) -> None:
+        """Attribute the peak CUDA memory since the previous call to that step's (B, T) shape.
+
+        Buckets share a token budget but not a memory cost, so the table (keyed by batch
+        size, i.e. one row per bucket) shows which ``bucket_batch_size`` entry to trim.
+        Each new overall peak is logged at once; the table every ``bucket_memory_every`` steps.
+        Off unless ``model.bucket_memory_every`` > 0.
+        """
+        if int(self.cfg.get("bucket_memory_every", 0) or 0) <= 0 or not torch.cuda.is_available():
+            return
+        if self._prev_step_shape is not None:
+            batch, seq = self._prev_step_shape
+            alloc = torch.cuda.max_memory_allocated() / 2**30
+            reserved = torch.cuda.max_memory_reserved() / 2**30
+            best = self._bucket_memory.get(batch)
+            steps = best[4] + 1 if best is not None else 1
+            if best is None or alloc > best[0]:
+                self._bucket_memory[batch] = (alloc, reserved, seq, batch * seq, steps)
+            else:
+                self._bucket_memory[batch] = (*best[:4], steps)
+            if alloc > self._peak_alloc_gib:
+                self._peak_alloc_gib = alloc
+                logging.info(
+                    f"[mem] new peak allocated: B={batch} T={seq} tokens={batch * seq} "
+                    f"alloc={alloc:.2f} GiB reserved={reserved:.2f} GiB"
+                )
+        torch.cuda.reset_peak_memory_stats()
+        self._prev_step_shape = (int(batch_size), int(seq_len))
+
+    def _dump_bucket_memory(self) -> None:
+        """Log the per-bucket peak table, most expensive first."""
+        lines = ["[mem] peak allocated per bucket (worst step of each), most expensive first:"]
+        lines.append("[mem]   batch    seqlen    tokens   alloc_GiB   reserved_GiB   steps")
+        for batch, (alloc, reserved, seq, tokens, steps) in sorted(self._bucket_memory.items(), key=lambda kv: -kv[1][0]):
+            lines.append(f"[mem] {batch:>7} {seq:>9} {tokens:>9} {alloc:>11.2f} {reserved:>14.2f} {steps:>7}")
+        logging.info("\n".join(lines))
 
     @property
     def text_vocab_size(self):
@@ -339,6 +380,9 @@ class SALM(LightningModule, HFHubMixin):
                 )
 
         B, T = inputs["input_embeds"].shape[:2]
+        self._profile_step_memory(B, T)
+        if self._bucket_memory and batch_idx > 0 and batch_idx % int(self.cfg.bucket_memory_every) == 0:
+            self._dump_bucket_memory()
         ans = {
             "loss": loss,
             "learning_rate": (
