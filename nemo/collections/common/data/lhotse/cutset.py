@@ -15,6 +15,7 @@
 
 import io
 import logging
+import math
 import os
 import random
 import re
@@ -2030,6 +2031,28 @@ def _user_text_with_timestamps(words, tokenizer, frame_length: float, sup_start:
     return " ".join(parts), next_free * frame_length
 
 
+def _simultaneous_answer_words(words, answer: str, lag: float, wait_words: int):
+    """Emission times of the answer words while the user speaks (``agent_timing: simultaneous``).
+
+    ``words`` are the user's ``(word, start, end)`` on the timeline. Returns ``(answer word, None, time)``
+    for ``_user_text_with_timestamps``, which emits a word's tokens from ``time``:
+
+    * transcription (the answer's words are the aligned words, as for the ASR manifests aligned by
+      align_asr_manifests.py): each word at its own end + ``lag``;
+    * otherwise (translation): no word-level correspondence, answer word ``i`` of ``n`` is emitted at the end
+      of source word ``ceil((i + 1) * n_src / n) - 1 + wait_words`` (proportional progress, wait-k style;
+      the last source word at most) + ``lag``.
+    """
+    answer_words = answer.split()
+    if [w for w, _, _ in words] == answer_words:
+        return [(w, None, end + lag) for w, _, end in words]
+    n_src, n = len(words), len(answer_words)
+    return [
+        (w, None, words[min(n_src - 1, math.ceil((i + 1) * n_src / n) - 1 + wait_words)][2] + lag)
+        for i, w in enumerate(answer_words)
+    ]
+
+
 def _convert_conversation_to_duplex(
     conv,
     tokenizer_path: str,
@@ -2042,6 +2065,9 @@ def _convert_conversation_to_duplex(
     asr_only: bool = False,
     agent_loss: bool = True,
     asr_loss: bool = True,
+    agent_timing: str = "after",
+    lag: float = 0.16,
+    wait_words: int = 2,
 ):
     """Helper for ``conversation_as_duplex``; module-level so that it can be pickled.
 
@@ -2062,6 +2088,11 @@ def _convert_conversation_to_duplex(
         user_words = None
     if asr_only and user_words is None:
         return None
+    simultaneous = agent_timing == "simultaneous"
+    assert agent_timing in ("after", "simultaneous"), f"conversation_as_duplex: unknown {agent_timing=}"
+    assert not (simultaneous and asr_only), "conversation_as_duplex: agent_timing=simultaneous needs an answer"
+    if simultaneous and user_words is None:
+        return None  # the answer is placed on the user's word timestamps
 
     # User text before the first answer (instruction, text context) -> system prompt.
     first_answer = next((i for i, t in enumerate(turns) if is_answer(t)), len(turns))
@@ -2121,6 +2152,25 @@ def _convert_conversation_to_duplex(
                                        start=user_start, duration=t - user_start, speaker="user", text=user_text))
         if answer is None:
             break
+        if simultaneous:
+            if not words:
+                return None
+            # The agent writes the answer while the user speaks. Its BOS goes one frame after the user turn
+            # start, never at frame 0 of the timeline: there it would only be an input (inference feeds <pad>),
+            # never a label. The answer tokens follow the word timestamps, EOS `hold` after the last one.
+            agent_start = user_start + frame_length
+            agent_text, text_end = _user_text_with_timestamps(
+                _simultaneous_answer_words(words, answer, lag, wait_words),
+                tokenizer,
+                frame_length,
+                agent_start,
+                first.sampling_rate,
+            )
+            agent_dur = text_end + hold - agent_start
+            sups.append(SupervisionSegment(id=f"{conv.id}-agent{k}", recording_id=first.recording_id,
+                                           start=agent_start, duration=agent_dur, speaker="agent", text=agent_text))
+            t = max(t, agent_start + agent_dur) + gap + rng.uniform(0.0, gap_jitter)
+            continue
         agent_start = t + gap + rng.uniform(0.0, gap_jitter)
         # BOS + one token per frame, then `hold` before the EOS that the duplex datasets put at the end.
         agent_dur = (n_tokens + 1) * frame_length + hold
@@ -2128,7 +2178,9 @@ def _convert_conversation_to_duplex(
                                        start=agent_start, duration=agent_dur, speaker="agent", text=answer))
         # The user's next turn starts after the agent's EOS.
         t = agent_start + agent_dur + gap + rng.uniform(0.0, gap_jitter)
-    end = sups[-1].end
+    # Simultaneous answers can end before the audio (trailing silence): pad from the later of the two, so
+    # that the padded timeline is always a MixedCut (a pad shorter than the cut returns the MonoCut as is).
+    end = max(max(s.end for s in sups), timeline.duration)
 
     duplex = timeline.pad(duration=end + tail, direction="right", preserve_id=True)
     # All supervisions live on the first track (offset 0), with absolute times on the timeline.
@@ -2191,6 +2243,19 @@ def read_conversation_as_duplex(config) -> tuple[CutSet, bool]:
     after the first answer, an answer without audio before it, an answer longer than ``max_agent_tokens``
     tokens); conversations without one complete exchange are dropped.
 
+    ``agent_timing: simultaneous`` (streaming transcription / translation, e.g. a single-head model with
+    ``predict_user_text: false``): the agent writes the answer *while* the user speaks instead of after.
+    Its BOS is one frame after the user turn start, its tokens are timestamped text (the duplex dataset needs
+    ``agent_text_timestamps: true``) emitted from:
+
+    * each word's end + ``lag`` when the answer's words are the aligned ``user_words`` (transcription);
+    * otherwise (translation), answer word ``i`` of ``n`` at the end of source word
+      ``ceil((i + 1) * n_src / n) - 1 + wait_words`` + ``lag``;
+
+    pushed later while the previous word's tokens are still being emitted, then EOS ``hold`` after the last
+    token. The next exchange starts ``gap`` (+ jitter) after the later of the audio end and that EOS.
+    Conversations without ``user_words`` are dropped.
+
     Input config YAML example (used inside an ``input_cfg`` list)::
 
         - type: conversation_as_duplex
@@ -2207,6 +2272,9 @@ def read_conversation_as_duplex(config) -> tuple[CutSet, bool]:
           asr_only: false
           agent_loss: true
           asr_loss: true
+          agent_timing: after      # or simultaneous
+          lag: 0.16                # simultaneous: seconds after the word end
+          wait_words: 2            # simultaneous, non-transcription answers: extra source words waited for
     """
     tokenizer_path = config.get("tokenizer", None) or os.environ.get("LLM_MODEL")
     assert tokenizer_path, "conversation_as_duplex needs `tokenizer` in its config or the LLM_MODEL env variable."
@@ -2223,6 +2291,9 @@ def read_conversation_as_duplex(config) -> tuple[CutSet, bool]:
         asr_only=config.get("asr_only", False),
         agent_loss=config.get("agent_loss", True),
         asr_loss=config.get("asr_loss", True),
+        agent_timing=config.get("agent_timing", "after"),
+        lag=config.get("lag", 0.16),
+        wait_words=config.get("wait_words", 2),
     )
     # apply_fn=None: the default (is_cut) would silently skip the conversations.
     return cuts.map(convert_fn, apply_fn=None).filter(_is_not_none), is_tarred

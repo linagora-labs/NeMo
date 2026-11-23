@@ -92,6 +92,7 @@ class DuplexSTTDataset(torch.utils.data.Dataset):
         self.prepend_word_space = cfg.get("prepend_word_space", True) if cfg is not None else True
         self.early_interruption_prob = cfg.get("early_interruption_prob", 0.0) if cfg is not None else 0.0
         self.add_mcq_val_prompt = cfg.get("add_mcq_val_prompt", False) if cfg is not None else False
+        self.agent_text_timestamps = cfg.get("agent_text_timestamps", False) if cfg is not None else False
 
         self.cfg = cfg
         self.model_cfg = model_cfg
@@ -279,7 +280,10 @@ class DuplexSTTDataset(torch.utils.data.Dataset):
                 roles=self.output_roles,
                 bos_id=self.tokenizer.bos,
                 eos_id=self.tokenizer.eos,
-                remove_timestamps=True,
+                # Timestamped agent text (conversation_as_duplex agent_timing=simultaneous) is placed word by
+                # word; otherwise its timestamps are dropped and the answer is written in one block.
+                remove_timestamps=not self.agent_text_timestamps,
+                prepend_word_space=self.prepend_word_space,
             )
 
             # Force align user text (runs in dataloader worker, overlapped with training)
@@ -333,7 +337,7 @@ class DuplexSTTDataset(torch.utils.data.Dataset):
                     for cut in all_cuts_combined
                 ],
                 "target_texts": [
-                    " ".join(s.text for s in cut.supervisions if s.speaker in self.output_roles)
+                    " ".join(_strip_timestamps(s.text) for s in cut.supervisions if s.speaker in self.output_roles)
                     for cut in all_cuts_combined
                 ],
                 "task": [getattr(cut, "task", "s2s_duplex") for cut in all_cuts_combined],

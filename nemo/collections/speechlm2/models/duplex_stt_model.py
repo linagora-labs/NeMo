@@ -499,6 +499,8 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             tolerance=13,
             latency_multiplier=0.08,
         ).reset()
+        # WER of the agent channel, for models whose agent transcribes (agent_timing: simultaneous).
+        self.agent_wer = WER().reset() if self.cfg.get("agent_wer", False) else None
 
         if self.predict_user_text:
             self.src_bleu = BLEU().reset()
@@ -525,6 +527,10 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         turn_taking_metrics = self.turn_taking_metrics.compute()
         for k, m in turn_taking_metrics.items():
             self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+
+        if self.agent_wer is not None:
+            for k, m in self.agent_wer.compute().items():
+                self.log(f"{prefix}_agent_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
 
         if self.predict_user_text:
             src_bleu = self.src_bleu.compute()
@@ -576,6 +582,12 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     refs=[dataset_batch["target_texts"][i] for i in has_agent],
                     hyps=[text_clean[i] for i in has_agent],
                 )
+                if self.agent_wer is not None:
+                    self.agent_wer.update(
+                        name=name,
+                        refs=[dataset_batch["target_texts"][i] for i in has_agent],
+                        hyps=[text_clean[i] for i in has_agent],
+                    )
                 if "source_tokens" in dataset_batch and results["tokens_text"] is not None:
                     self.turn_taking_metrics.update(
                         name=name,
