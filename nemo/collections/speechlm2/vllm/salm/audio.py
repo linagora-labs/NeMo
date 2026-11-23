@@ -264,6 +264,36 @@ class NeMoSpeechLMMultiModalProcessor(
         """
         return self.info.get_data_parser()
 
+    def _apply_hf_processor_main(self, *args, **kwargs) -> BatchFeature:
+        """Build the audio features ourselves on vLLM >= 0.28.
+
+        From 0.28 on, the prompt is tokenized by the renderer and this method only
+        gets the multimodal items, which it hands to ``info.get_hf_processor()``
+        (there is no HF processor for SALM: vLLM falls back to the tokenizer and
+        fails), so ``_call_hf_processor`` is never called. Older vLLM passes the
+        prompt too and goes through ``_call_hf_processor``. The waveforms are kept
+        in float32: ``ctx.call_hf_processor`` would cast them to the model dtype.
+        """
+        if args or "prompt" in kwargs or "mm_items" not in kwargs:
+            return super()._apply_hf_processor_main(*args, **kwargs)
+        mm_items = kwargs["mm_items"]
+        if "audio" not in mm_items:
+            return BatchFeature({})
+        audios = mm_items.get_items("audio", AudioProcessorItems)
+        audio_list = []
+        for i in range(audios.get_count()):
+            audio = audios.get(i)
+            audio = audio if isinstance(audio, torch.Tensor) else torch.as_tensor(audio)
+            audio_list.append(audio.to(torch.float32).squeeze())
+        if not audio_list:
+            return BatchFeature({})
+        return BatchFeature(
+            dict(
+                audio_signal=audio_list,
+                audio_signal_length=torch.tensor([a.shape[-1] for a in audio_list]),
+            )
+        )
+
     def _get_mm_fields_config(
         self,
         hf_inputs: BatchFeature,
@@ -297,16 +327,25 @@ class NeMoSpeechLMMultiModalProcessor(
         audios = mm_items.get_items("audio", AudioProcessorItems)
         chunk_size_seconds = self.info._get_encoder_chunk_size_seconds()
 
+        # vLLM >= 0.28 applies prompt updates on token ids only (no select_text).
+        if hasattr(PromptUpdateDetails, "select_text"):
+            target = _AUDIO_PLACEHOLDER
+        else:
+            audio_token_id = self.info.get_tokenizer().convert_tokens_to_ids(_AUDIO_PLACEHOLDER)
+            target = [audio_token_id]
+
         def get_replacement(item_idx: int):
             audio = audios.get(item_idx)
             n_tokens = self.info._estimate_audio_tokens(audio.shape[-1], chunk_size_seconds)
+            if isinstance(target, list):
+                return PromptUpdateDetails.select_token_id(target * n_tokens, audio_token_id)
             repl_full = _AUDIO_PLACEHOLDER * n_tokens
             return PromptUpdateDetails.select_text(repl_full, _AUDIO_PLACEHOLDER)
 
         return [
             PromptReplacement(
                 modality="audio",
-                target=_AUDIO_PLACEHOLDER,
+                target=target,
                 replacement=get_replacement,
             )
         ]

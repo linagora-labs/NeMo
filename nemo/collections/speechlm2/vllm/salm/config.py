@@ -25,6 +25,7 @@ own ``architectures`` field.
 from pathlib import Path
 
 from transformers import AutoConfig, PretrainedConfig
+from transformers.utils import cached_file
 
 from nemo.collections.speechlm2.parts.hf_hub import LLM_BACKBONE_DIR
 
@@ -237,9 +238,13 @@ class NeMoSpeechLMConfig(PretrainedConfig):
         """
         root = getattr(self, "_name_or_path", "")
         if root:
-            local = Path(root) / LLM_BACKBONE_DIR
-            if (local / "config.json").is_file():
-                return str(local)
+            # ``cached_file`` resolves both a local directory and a Hub id (the
+            # served model being then the repo id, not a path).
+            resolved = cached_file(
+                root, f"{LLM_BACKBONE_DIR}/config.json", _raise_exceptions_for_missing_entries=False
+            )
+            if resolved is not None:
+                return str(Path(resolved).parent)
         return pretrained_llm
 
     @property
